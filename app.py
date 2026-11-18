@@ -17,10 +17,11 @@ def main():
     import json
     import logging
     from logging.handlers import RotatingFileHandler
+    from ba_scout import __version__
     from ba_scout.settings import prepare_runtime_paths, f_path, read_path, load_settings
     prepare_runtime_paths()
 
-    parser = argparse.ArgumentParser(description="断箭战前情报 0.7.4 便携分享版")
+    parser = argparse.ArgumentParser(description=f"断箭战前情报 {__version__} 便携分享版")
     parser.add_argument("--replay-log", help="手动回放指定历史日志；会明确显示历史测试标记")
     parser.add_argument("--self-test", action="store_true", help="界面自动测试，完成后退出")
     parser.add_argument("--test-output", default=str(ROOT / "work" / "ui-test.json"))
@@ -45,7 +46,7 @@ def main():
         import _tkinter
         import platform
         from ba_scout.settings import atomic_json
-        result = dict(version='0.7.4', frozen=bool(getattr(sys, 'frozen', False)),
+        result = dict(version=__version__, frozen=bool(getattr(sys, 'frozen', False)),
                       executable=sys.executable, root=str(ROOT), temp=os.environ['TEMP'],
                       python=sys.version, bitness=platform.architecture()[0],
                       ssl=ssl.OPENSSL_VERSION, tkinter=_tkinter.__file__,
@@ -53,7 +54,7 @@ def main():
         if args.check_network:
             from urllib.request import Request, urlopen
             try:
-                with urlopen(Request('https://dash.batrace.top/', headers={'User-Agent': 'BA-Scout/0.7.4 runtime-check'}), timeout=8) as response:
+                with urlopen(Request('https://dash.batrace.top/', headers={'User-Agent': f'BA-Scout/{__version__} runtime-check'}), timeout=8) as response:
                     result['https'] = {'url': response.url, 'status': response.status, 'read_bytes': len(response.read(256))}
             except Exception as exc:
                 result['https'] = {'error': str(exc)}

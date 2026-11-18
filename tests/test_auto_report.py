@@ -34,7 +34,7 @@ def make_window():
         players=roster.players, stale_history_ids=set(), hwnd=0,
         hotkeys=SimpleNamespace(poll=lambda: []), compact=Mock(), report_button=Mock(),
         table=Mock(), render_rows=Mock(), update_summary=Mock(), selected_id=None,
-        opening_view_seconds=20, analysis_mode="opening", expanded=True,
+        opening_view_seconds=20, analysis_mode="opening", analysis_button=Mock(), expanded=True,
         select_team=Mock(), show_view=Mock(), summary_text=Mock(), detail_text=Mock(), detail_title=Mock(),
         button=Mock(),
     )

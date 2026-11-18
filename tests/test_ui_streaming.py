@@ -53,6 +53,69 @@ class StreamingUiTests(unittest.TestCase):
         self.assertIsNone(w.auto_report_attempted_scan_id)
         self.assertIn('5/5', w.status.set.call_args.args[0])
 
+    def test_visible_tree_keeps_game_slots_as_names_and_fields_arrive(self):
+        try:
+            root = ui.tk.Tk()
+        except ui.tk.TclError as exc:
+            self.skipTest(f"Tk display unavailable: {exc}")
+        self.addCleanup(root.destroy)
+        root.withdraw()
+        w = self.window
+        columns = ("name", "rating", "record", "spec", "recent", "status")
+        w.table = ui.ttk.Treeview(root, columns=columns)
+        w.row_font = ui.tkfont.Font(root=root, family="Microsoft YaHei UI", size=9)
+        w.table.column("recent", width=194)
+        w.render_rows()
+        self.assertEqual(w.table.get_children(), tuple(f"slot-{i}" for i in range(5)))
+
+        event = snapshot(ids=(31,))
+        event["players"][0]["index"] = 3
+        event["rows"] = [{"index": 0, "team": "Bravo", "resolution": {"status": "ambiguous"}},
+                         {"index": 2, "team": "Bravo", "resolution": {"status": "timeout"}}]
+        self.emit(event)
+        self.assertEqual(w.table.get_children(), ("slot-0", "slot-1", "slot-2", "31", "slot-4"))
+        self.assertEqual(w.table.set("slot-0", "status"), "重名待确认")
+        self.assertEqual(w.table.set("slot-2", "status"), "查名超时")
+        self.assertEqual(w.table.set("31", "status"), "查战绩中")
+        w.states[31] = {
+            "status": "partial", "data": {"player_id": 31, "from_cache": True, "rating": 1900,
+                                         "wins": 6, "ranked_games": 10},
+            "partial_data": {"player_id": 31, "rating": 2100, "wins": 9},
+        }
+        w.opening20_states[31] = {"data": {"sample_count": 3, "requested_count": 5,
+                                           "units": [{"name": "AH-64D", "matches_with_unit": 2}]}}
+        w.render_rows()
+        self.assertEqual(w.table.set("31", "rating"), "2,100")
+        self.assertIn("60.0%*", w.table.set("31", "record"))
+        self.assertIn("AH-64D 2/3局", w.table.set("31", "recent"))
+        self.assertEqual(w.table.set("31", "status"), "*旧缓存")
+
+        event = snapshot(2, (32,))
+        event["players"][0]["index"] = 1
+        event["rows"] = [{"index": 3, "team": "Bravo", "resolution": {"status": "conflict"}}]
+        self.emit(event)
+        self.assertEqual(w.table.get_children(), ("slot-0", "32", "slot-2", "slot-3", "slot-4"))
+        self.assertEqual(w.table.set("slot-3", "status"), "身份冲突")
+        w.table.selection_set("slot-3")
+        w.on_select()
+        self.assertIsNone(w.selected_id)
+        self.assertIsNone(ui.ScoutWindow.player_details(w))
+        self.assertFalse(w.table.exists("31"))
+
+    def test_current_explicit_zero_and_missing_inputs_remain_distinct(self):
+        old = {"player_id": 31, "from_cache": True, "rating": 1800, "wins": 6, "ranked_games": 10,
+               "specs": [{"key": "12_7"}]}
+        partial = {"player_id": 31, "rating": 0, "wins": 0, "ranked_games": 0,
+                   "specs_available": True, "specs": []}
+        fields, cached = ui.overview_fields({"data": old, "partial_data": partial}, 31)
+        self.assertEqual(fields["rating"], 0)
+        self.assertIsNone(fields["win_rate"])
+        self.assertEqual(fields["specs"], [])
+        self.assertEqual(cached, [])
+        fields, _ = ui.overview_fields({"data": old, "partial_data": {**partial, "player_id": 32}}, 31)
+        self.assertEqual(fields["rating"], 1800)
+        self.assertEqual(fields["win_rate"], 60)
+
     def test_changed_identity_withdraws_old_results_and_old_revision_cannot_restore(self):
         self.emit(snapshot())
         self.window.states[30] = {'status': 'ok', 'data': {'player_id': 30}}

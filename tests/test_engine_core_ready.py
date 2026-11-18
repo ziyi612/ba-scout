@@ -101,6 +101,28 @@ class CoreReadyTests(unittest.TestCase):
         self.assertIsNone(rows[-1]['data'])
         self.assertEqual(es[-1]['complete'],0)
 
+    def test_legacy_v3_rechecks_win_denominator_specializations_and_history_before_cache_hit(self):
+        base = dict(wins=1, ranked_games=2, specs=[{'key': '4_5', 'experience': 10}], recent_match_ids=['44'])
+        for changes, status in (({}, 'cached'), ({'ranked_games': None}, 'stale'),
+                                ({'specs': []}, 'stale'), ({'recent_match_ids': []}, 'stale')):
+            with self.subTest(changes=changes):
+                stamp = datetime.now(timezone.utc).isoformat()
+                data = player_data(6, profile_version=3, core_ready=True, **{**base, **changes})
+                (self.path/'6.json').write_text(json.dumps(dict(schema=1, player_id=6, stored_at=stamp, data=data)), 'utf-8')
+                calls = []
+                def fetch(pid, timeout):
+                    calls.append(pid)
+                    return player_data(pid, profile_version=4, core_ready=True, **base)
+                ctrl = ScanController(str(self.path), fetch, min_profile_version=4)
+                self.controllers.append(ctrl)
+                ctrl.start(roster(ids=[6]), 1)
+                events = [e for e in wait_finished(ctrl) if e['type'] == 'player']
+                self.assertEqual(events[0]['status'], status)
+                self.assertEqual(calls, [6] if status == 'stale' else [])
+                if changes.get('ranked_games', 1) is None:
+                    self.assertFalse(events[0]['data']['core_ready'])
+
+
 
 if __name__=='__main__':
     unittest.main()

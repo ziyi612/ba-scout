@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from . import __version__
+
 from datetime import datetime, timezone
 import math
 from typing import Any
@@ -75,8 +77,11 @@ def _unit_name(unit: dict) -> str:
 def _core_lines(player_id: Any, state: dict) -> list[str]:
     data = _dict(state.get("data"))
     status = _STATUS.get(state.get("status"), _UNKNOWN)
-    if state.get('status') == 'partial':
-        status = "仅取得基础资料；本次累计战绩与专精统计暂缺"
+    if state.get('status') in {'partial', 'loading'}:
+        status = "已取得部分字段" if state.get('status') == 'partial' else "已取得部分字段，仍在查询"
+        current = _dict(state.get('partial_data')) or data
+        if current.get('wins') is None and current.get('ranked_games') is None and not current.get('specs_available'):
+            status += "；本次累计战绩与专精统计暂缺"
     if data.get("from_cache") and state.get("status") in {"error", "timeout", "partial"}:
         status += "；以下沿用旧缓存"
     lines = ["核心数据：" + status]
@@ -91,6 +96,14 @@ def _core_lines(player_id: Any, state: dict) -> list[str]:
             "  本次基础资料抓取时间：" + _time(fresh.get('fetched_at')),
             "  本次基础资料来源：" + _text(fresh.get('source_url')),
         ])
+        if fresh.get('wins') is not None or fresh.get('ranked_games') is not None:
+            rate = profile_metrics(fresh)['win_rate']
+            lines.append(f"  本次排位：胜 {_number(fresh.get('wins'))} / 总场数 {_number(fresh.get('ranked_games'))}；胜率 {_number(rate, 1, '%')}")
+        if fresh.get('specs_available'):
+            entries = fresh.get('specs') or []
+            lines.append("  本次历史双专精：" + ("，".join(f"{short_combo(item)}（{_number(item.get('experience'))}）"
+                                                     for item in entries) or "已返回清单，无正经验组合"))
+        lines.append("  原缓存明细")
     if not data:
         return lines + ["  战绩、评分与专精数据未取得。"]
     metrics = profile_metrics(data)
@@ -203,6 +216,8 @@ def _window_overview(summary: Any, opening_states: Any, roster: Any, enemy_ids: 
                 line += f"；未计入 {len(skipped)} 局"
             if player.get("stale_history"):
                 line += "；旧比赛清单"
+                if player.get("history_fetched_at"):
+                    line += "，清单采集时间 " + _time(player["history_fetched_at"])
             lines.append(line)
             if player.get("message"):
                 lines.append("    " + _text(player.get("message")))
@@ -307,7 +322,7 @@ def build_scout_report(
             "设置窗口与固定前20秒窗口范围相同。" if opening_window_seconds == 20 else
             "设置窗口短于20秒，是固定前20秒窗口的一部分。"
         )
-        overview = ["断箭数据汇总 0.7.4 · 双时间窗", f"阵容对局ID：{_identifier(_get(roster, 'fight_id'))}；模式：{mode}",
+        overview = [f"断箭数据汇总 {__version__} · 双时间窗", f"阵容对局ID：{_identifier(_get(roster, 'fight_id'))}；模式：{mode}",
                     "生成时间：" + _time(generated),
                     "两窗共享同批对局查询，各自使用有效样本与缺失记录；没有新增一套对局请求。", relation, ""]
         overview.extend(_window_overview(data_summary20, opening20_states, roster, enemy_ids, 20, first_title))

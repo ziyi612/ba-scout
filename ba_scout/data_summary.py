@@ -219,10 +219,15 @@ def build_data_summary(roster, states, opening_states, recon_states, enemy_ids, 
                 player_roles.setdefault(role, set()).update(valid_ids)
         units.sort(key=lambda item: (-(item["matches_with_unit"] if item["matches_with_unit"] is not None else -1), -(item["total_spawns"] if item["total_spawns"] is not None else -1), item["name"].casefold(), item["id"] or 0))
         profile = _state(states, pid)
+        previous = _dict(profile.get("data"))
+        latest = _dict(profile.get("partial_data"))
+        history_at = (latest.get("history_fetched_at") or previous.get("history_fetched_at")
+                      or previous.get("fetched_at")) if pid in stale else None
         player = {"player_id": pid, "name": _text(person.get("name"), f"玩家 {pid}"), "team": _text(person.get("team")),
                   "status": "error" if wrong_event else _text(event.get("status"), "pending"), "message": _text(event.get("message"), ""),
                   "finished": event.get("finished") is True, "profile_status": _text(profile.get("status"), "pending"),
-                  "stale_history": pid in stale, "sample_count": usable_count, "requested_count": requested,
+                  "stale_history": pid in stale, "history_fetched_at": history_at,
+                  "sample_count": usable_count, "requested_count": requested,
                   "window_seconds": actual_window, "classification_complete": classification_complete,
                   "opening_units_available": isinstance(raw_units, list),
                   "units": units, "matches": list(matches.values()), "unusable_matches": _copy(data.get("unusable_matches"), []),
@@ -291,7 +296,10 @@ def summary_sections(summary: dict) -> list[tuple[str, str]]:
         shown = min(3, len(units))
         extent = f"摘要前{shown}/共{len(units)}种" if player.get("opening_units_available") else "单位明细未取得"
         title = f"{markers[player['player_id']]}{player['name']} · 开局前{_fmt(player.get('window_seconds'))}秒 · {extent}"
-        lines = [f"有效样本 {_fmt(player.get('sample_count'))}/{_fmt(player.get('requested_count'))} 局" + ("；旧清单" if player.get("stale_history") else "")]
+        old_label = "；旧清单" if player.get("stale_history") else ""
+        if old_label and player.get("history_fetched_at"):
+            old_label += " " + str(player["history_fetched_at"])
+        lines = [f"有效样本 {_fmt(player.get('sample_count'))}/{_fmt(player.get('requested_count'))} 局" + old_label]
         if units:
             lines.extend(_opening_unit_line(unit) for unit in units[:3])
             lines.append("按出现局数作数值排序；完整名单见详情/TXT。")

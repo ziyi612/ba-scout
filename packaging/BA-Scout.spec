@@ -1,7 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+from runpy import run_path
 
 ROOT = Path(SPECPATH).resolve().parent
+release_version = run_path(str(ROOT / 'ba_scout' / '__init__.py'))['__version__']
+windows_version = run_path(str(ROOT / 'packaging' / 'version_info.py'))['windows_version_info']
 
 a = Analysis(
     [str(ROOT / 'app.py')],
@@ -33,7 +36,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    version=str(Path(SPECPATH) / 'version_info.py'),
+    version=windows_version(release_version),
 )
 coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False,
                upx_exclude=[], name='BA-Scout')

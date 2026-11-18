@@ -72,6 +72,39 @@ def rsc_script(record_id, value):
 
 
 class ProviderTests(unittest.TestCase):
+    def test_stream_merges_verified_fields_and_publishes_history_before_full_statistics(self):
+        first = {"playerData": {"info": {"id": 71, "rank": 42}, "last_fights_data": [91, 90],
+                                "statInfo": {"playerId": 71, "winCountRt": 1}},
+                 "specNames": {"4": "装甲", "5": "空降"}}
+        second = {"playerData": {"info": {"id": 71, "rating": 1700},
+                                 "statInfo": {"playerId": 71, "lossCountRt": 1, "fightsCountRt": 2,
+                                              "combinedSpecsExp": {"4_5": 80}}}}
+        other = {"playerData": {"info": {"id": 99, "rating": 9999}, "last_fights_data": [1000],
+                                "statInfo": {"playerId": 99, "winCountRt": 50}}}
+        response = ChunkedResponse([rsc_script("1", first) + rsc_script("2", other), rsc_script("3", second),
+                                    AssertionError("The remaining HTML is optional")])
+        seen = []
+        with patch("ba_scout.provider.urlopen", return_value=response):
+            result = fetch_player(71, on_progress=lambda data: seen.append((response.read_calls, data)))
+        self.assertEqual(len(seen), 1)
+        at, early = seen[0]
+        self.assertEqual((at, early["player_id"], early["recent_match_ids"]), (1, 71, ["91", "90"]))
+        self.assertFalse(early["core_ready"])
+        self.assertEqual((result["rank"], result["rating"], result["wins"], result["ranked_games"]), (42, 1700, 1, 2))
+        self.assertEqual(result["specs"][0]["key"], "4_5")
+        self.assertTrue(result["core_ready"])
+        self.assertTrue(result["recent_history_available"])
+
+    def test_missing_invalid_and_empty_recent_lists_have_distinct_meanings(self):
+        for data, available in (({}, False), ({"last_fights_data": "$ff"}, False),
+                                ({"last_fights_data": ["bad"]}, False), ({"last_fights_data": []}, True)):
+            player = {"info": {"id": 71}, "statInfo": {"playerId": 71, "winCountRt": 1}, **data}
+            with self.subTest(data=data):
+                profile = parse_player_html(rsc_script("1", {"playerData": player}).decode(), 71)
+                self.assertEqual(profile["recent_history_available"], available)
+                self.assertFalse(profile["core_ready"])
+                self.assertEqual(profile["recent_match_ids"], [])
+
     def test_recent_ids_available_without_match_map_and_deduplicated(self):
         profile = {"info": {"id": 810001}, "statInfo": {"playerId": 810001},
                    "last_fights_data": [True, 0, "0031", 31, "bad", "30", 29, -1, "28", 27, 26]}
@@ -104,7 +137,7 @@ class ProviderTests(unittest.TestCase):
 
     def test_additional_profile_fields_missing_are_unknown(self):
         result = parse_player_html(page_fixture({"info": {"id": 810001}}), 810001)
-        self.assertEqual(result["profile_version"], 3)
+        self.assertEqual(result["profile_version"], 4)
         for key in ("ranked_kills", "ranked_losses_units", "ranked_killed_value", "ranked_lost_value", "ranked_duration_seconds", "last_match_id"):
             self.assertIsNone(result[key], key)
         self.assertEqual(result["nation_experience"], {})
@@ -200,7 +233,8 @@ class ProviderTests(unittest.TestCase):
 
     def test_stream_returns_before_slow_tail_after_verified_core_and_names(self):
         profile = {"playerData": {"info": {"id": 810001, "name": "样例"},
-                    "statInfo": {"playerId": 810001, "winCountRt": 1, "combinedSpecsExp": {"5_6": 100}}}}
+                    "statInfo": {"playerId": 810001, "winCountRt": 1, "fightsCountRt": 2,
+                                 "combinedSpecsExp": {"5_6": 100}}, "last_fights_data": []}}
         response = ChunkedResponse([
             rsc_script("1", profile),
             rsc_script("2", {"specNames": {"5": "空降师", "6": "斯特瑞克旅"}}),
@@ -314,7 +348,8 @@ class ProviderTests(unittest.TestCase):
     def test_later_complete_model_is_not_shadowed_by_early_identity_only_model(self):
         first = {"playerData": {"info": {"id": 810001, "name": "样例"}}}
         second = {"playerData": {"info": {"id": 810001, "name": "样例"},
-                                 "statInfo": {"playerId": 810001, "winCountRt": 9}}}
+                                 "statInfo": {"playerId": 810001, "winCountRt": 9, "fightsCountRt": 12,
+                                              "combinedSpecsExp": {}}, "last_fights_data": []}}
         response = ChunkedResponse([rsc_script("1", first), rsc_script("2", second),
                                     rsc_script("3", {"specNames": {"5": "空降师"}}), TimeoutError("tail")])
         with patch("ba_scout.provider.urlopen", return_value=response):
@@ -328,7 +363,7 @@ class ProviderTests(unittest.TestCase):
             rsc_script("1", {"playerData": "$@2", "specNames": "$5"}),
             rsc_script("2", {"info": "$3", "statInfo": "$@4", "last_fights_data": "$6"}),
             rsc_script("3", {"id": 810001, "name": "$1", "rating": 2100}),
-            rsc_script("4", {"playerId": 810001, "winCountRt": 10, "lossCountRt": 0,
+            rsc_script("4", {"playerId": 810001, "winCountRt": 10, "lossCountRt": 0, "fightsCountRt": 10,
                              "combinedSpecsExp": "$7:experience", "nationExp": "$8"}),
             rsc_script("5", {"5": "空降师", "6": "斯特瑞克旅"}),
             rsc_script("6", ["123", "122"]),
@@ -380,8 +415,8 @@ class ProviderTests(unittest.TestCase):
 
     def test_zero_experience_profile_can_finish_early(self):
         data = {"info": {"id": 810001}, "statInfo": {
-            "playerId": 810001, "combinedSpecsExp": {"5_6": 0},
-        }}
+            "playerId": 810001, "combinedSpecsExp": {"5_6": 0}, "winCountRt": 0, "fightsCountRt": 0,
+        }, "last_fights_data": []}
         response = ChunkedResponse([page_fixture(data).encode("utf-8"), TimeoutError("tail")])
         with patch("ba_scout.provider.urlopen", return_value=response):
             result = fetch_player(810001)

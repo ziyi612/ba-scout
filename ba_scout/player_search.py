@@ -11,6 +11,8 @@ The caller must still enforce the shared preparation-stage time budget.
 
 from __future__ import annotations
 
+from . import __version__
+
 import json
 import math
 import unicodedata
@@ -26,7 +28,7 @@ LEGACY_SEARCH_LIMIT = 20
 SEARCH_LIMIT = 50
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_NAME_LENGTH = 256
-USER_AGENT = "BA-Scout/0.7.4 (local public player identity lookup)"
+USER_AGENT = f"BA-Scout/{__version__} (local public player identity lookup)"
 
 
 class PlayerSearchError(ValueError):

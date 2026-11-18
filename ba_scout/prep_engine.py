@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from urllib.error import HTTPError
 
 from .player_search import normalize_name, resolve_exact_name, search_players
+from .request_gate import RequestCooldown
 
 
 _NAME_REQUEST_LIMIT = 8
@@ -57,6 +58,7 @@ class _StreamRow:
     resolution: dict | None = None
     scheduled: set = field(default_factory=set)
     batches: dict = field(default_factory=dict)
+    recovery: bool = False
 
 
 @dataclass
@@ -183,7 +185,8 @@ class PrepController:
     confirmed, and ``player_deadlines`` bounds each newly observed identity's
     data fetch. The first report deadline never moves. Unchanged successful
     name queries are cached within a generation; at most 30 HTTP calls and 12
-    variants per row are admitted. Only transient failures may retry once.
+    variants per row are admitted. An unchanged stable slot can recover once
+    after a timeout or a shared cooldown, reusing its finished variant queries.
 
     Manual input retains one final result, a shared 12-second lookup window,
     an eight-request cap, and enemies before allies. Neither path guesses IDs.
@@ -204,6 +207,7 @@ class PrepController:
             raise ValueError("searcher and a shared RequestGate are required")
         self.ocr = ocr
         self.request_gate = request_gate
+        self._cooldown_remaining = getattr(request_gate, "cooldown_remaining", lambda: 0.0)
         self.searcher = searcher
         self.extractor = extractor or _default_extract
         self.concurrency = concurrency
@@ -420,6 +424,7 @@ class PrepController:
                             stable_count += 1
                             record = scan.stream_rows.get(key)
                             if record is not None and record.signature == signature:
+                                self._resume_row(scan, key, record)
                                 continue
                             if record is not None and self._reuse_resolved_subset(record, row, signature):
                                 continue
@@ -493,6 +498,30 @@ class PrepController:
         record.resolution = resolution
         return True
 
+    def _resume_row(self, scan, key, record):
+        # Only a fresh stable observation while still in this waiting room may
+        # open a second window. A new record invalidates every old queued task.
+        decision = record.resolution or {}
+        retry_at = decision.get("retry_at")
+        if retry_at is None or record.recovery:
+            return
+        now = time.monotonic()
+        if self._cooldown_remaining() > 0:
+            return
+        if decision["status"] != "rate_limited" and now < retry_at:
+            return
+        scan.stream_rows[key] = _StreamRow(
+            record.row, record.signature, record.version + 1,
+            now + self.lookup_budget, now + self.total_budget,
+            batches=record.batches.copy(), scheduled=set(record.batches), recovery=True)
+
+    def _timeout_resolution(self, record):
+        if record.recovery:
+            return _empty_resolution("timeout", "本行自动补查已超时，其余对手继续查询。")
+        decision = _empty_resolution("timeout", "本行首次查名超时，准备界面持续显示该姓名时将自动补查。")
+        decision["retry_at"] = time.monotonic() + _STREAM_RETRY_DELAY
+        return decision
+
     def _stream_schedule(self, scan):
         if not self._live(scan):
             return
@@ -501,12 +530,12 @@ class PrepController:
         # in one worker or allocating another pool.
         while not self._jobs.full():
             admitted = False
-            for key, record in sorted(scan.stream_rows.items()):
+            for key, record in sorted(scan.stream_rows.items(), key=lambda item: (item[1].recovery, item[0])):
                 if record.resolution is not None:
                     continue
                 if time.monotonic() >= record.lookup_deadline:
                     record.pending = False
-                    record.resolution = _empty_resolution("timeout", "此行连续画面确认耗尽查询时间；等待姓名变化或手动核对。")
+                    record.resolution = self._timeout_resolution(record)
                     continue
                 variant = next((name for name in record.row["variants"] if name not in record.scheduled), None)
                 if variant is None or self._jobs.full():
@@ -526,7 +555,7 @@ class PrepController:
         for record in scan.stream_rows.values():
             if record.pending and now >= record.lookup_deadline:
                 record.pending = False
-                record.resolution = _empty_resolution("timeout", "此行身份查询时间已到，未完整查完所有变体；其他对手继续。")
+                record.resolution = self._timeout_resolution(record)
                 changed = True
         first_deadline = scan.deadline is not None and now >= scan.deadline and not scan.initial_reported
         if first_deadline:
@@ -540,13 +569,17 @@ class PrepController:
             return error.code in {408, 500, 502, 503, 504}
         return isinstance(error, (OSError, TimeoutError))
 
+    @staticmethod
+    def _rate_limited(error):
+        return isinstance(error, RequestCooldown) or isinstance(error, HTTPError) and error.code == 429
+
     def _stream_current(self, scan, key, record):
         return self._live(scan) and scan.stream_rows.get(key) is record
 
     def _stream_query_active(self, scan, key, record):
         return self._stream_current(scan, key, record) and record.resolution is None
 
-    def _stream_http(self, scan, key, record, variant, memo):
+    def _stream_http(self, scan, key, record, variant, memo, *, timeout):
         # RequestGate calls this only after permitting actual network work.
         with self._condition:
             if not self._stream_query_active(scan, key, record):
@@ -560,7 +593,7 @@ class PrepController:
                 raise _NameRequestLimit(_STREAM_LIMIT_REASON)
             scan.name_requests += 1
             memo.attempts += 1
-        return self.searcher(variant, timeout=min(self.search_timeout, remaining))
+        return self.searcher(variant, timeout=min(self.search_timeout, remaining, timeout))
 
     def _stream_search(self, scan, key, record, variant):
         """Generation-local single flight cache, including bounded failures."""
@@ -578,9 +611,15 @@ class PrepController:
                     self._condition.wait(min(.05, remaining))
                     continue
                 if memo.error is not None:
-                    if memo.attempts >= 2 or not self._transient(memo.error):
+                    if memo.attempts >= 2:
                         raise memo.error
-                    delay = memo.retry_at - time.monotonic()
+                    if self._rate_limited(memo.error):
+                        if self._cooldown_remaining() > 0:
+                            raise memo.error
+                    elif (not self._transient(memo.error)
+                          or isinstance(memo.error, TimeoutError) and not record.recovery):
+                        raise memo.error
+                    delay = 0.0 if self._rate_limited(memo.error) else memo.retry_at - time.monotonic()
                     if delay > 0:
                         self._condition.wait(min(.05, delay, remaining))
                         continue
@@ -589,22 +628,22 @@ class PrepController:
             result = None
             error = None
             try:
-                result = self.request_gate.run(self._stream_http, scan, key, record, variant, memo)
+                result = self.request_gate.run(self._stream_http, scan, key, record, variant, memo, timeout=remaining)
                 if not isinstance(result, list):
                     raise ValueError("姓名搜索没有返回候选列表")
             except Exception as exc:
                 error = exc
             with self._condition:
                 memo.running = False
-                memo.error = error
-                memo.result = result if error is None else None
-                memo.retry_at = time.monotonic() + _STREAM_RETRY_DELAY if error is not None and self._transient(error) else float("inf")
-                if (error is not None and memo.attempts == attempts_before
-                        and not self._stream_query_active(scan, key, record)
-                        and scan.name_cache.get(variant) is memo):
-                    # An invalidated slot is not a network failure for another
-                    # slot that shares this name. Keep only real response data.
-                    scan.name_cache.pop(variant, None)
+                stale_admission = (error is not None and memo.attempts == attempts_before
+                                   and not self._stream_query_active(scan, key, record))
+                if not stale_admission:
+                    memo.error = error
+                    memo.result = result if error is None else None
+                    memo.retry_at = (time.monotonic() + _STREAM_RETRY_DELAY
+                                     if error is not None and self._transient(error) else float("inf"))
+                # A cancelled admission leaves prior real attempts and results
+                # intact for other rows and the recovery window.
                 self._condition.notify_all()
             # Returning through the loop verifies cancellation, row version,
             # and deadline even when the last network call returned late.
@@ -617,9 +656,14 @@ class PrepController:
         except _NameRequestLimit:
             failure = _empty_resolution("incomplete", _STREAM_LIMIT_REASON)
         except TimeoutError:
-            failure = _empty_resolution("timeout", "此行身份查询时间已到，未完整查完所有变体；其他对手继续。")
+            failure = self._timeout_resolution(record)
         except Exception as exc:
-            failure = _empty_resolution("error", "此行搜索未完整成功，暂不确认身份：" + str(exc)[:180])
+            if self._rate_limited(exc):
+                delay = self._cooldown_remaining()
+                failure = _empty_resolution("rate_limited", f"数据站限流，约 {math.ceil(delay)} 秒后结束冷却。")
+                failure["retry_at"] = time.monotonic() + delay
+            else:
+                failure = _empty_resolution("error", "此行搜索未完整成功，暂不确认身份：" + str(exc)[:180])
         with self._condition:
             if self._stream_query_active(scan, key, record) and time.monotonic() < record.lookup_deadline:
                 if failure is not None:
@@ -643,7 +687,9 @@ class PrepController:
         rows_by_key = {(row["team"], row["index"]): copy.deepcopy(row) for row in scan.rows}
         for key, record in scan.stream_rows.items():
             row = copy.deepcopy(record.row)
-            row["resolution"] = copy.deepcopy(record.resolution or _empty_resolution("searching", "此行已稳定，正在查询完整姓名变体。"))
+            reason = "正在自动补查尚未完成的姓名变体。" if record.recovery else "此行已稳定，正在查询完整姓名变体。"
+            status = "retrying" if record.recovery else "searching"
+            row["resolution"] = copy.deepcopy(record.resolution or _empty_resolution(status, reason))
             rows_by_key[key] = row
         rows = [row for _, row in sorted(rows_by_key.items(), key=lambda item: (item[0][0] != "Bravo", item[0][1]))]
         occurrences = {}

@@ -21,6 +21,27 @@ class PartialProfileHistoryTests(unittest.TestCase):
         self.assertEqual(window.states[42]['status'], 'partial')
         self.assertFalse(window.states[42]['data']['core_ready'])
 
+    def test_progress_missing_history_keeps_old_sample_until_new_list_is_explicit(self):
+        window, events, submitted = self.make_window()
+        old = {'player_id': 42, 'from_cache': True, 'recent_match_ids': ['90']}
+        events.append(dict(type='player', scan_id=7, player_id=42, status='stale', data=old))
+        ScoutWindow.tick(window)
+        fresh = {'player_id': 42, 'recent_match_ids': [], 'recent_history_available': False}
+        events.append(dict(type='player_progress', scan_id=7, player_id=42, status='loading', data=old, partial_data=fresh))
+        ScoutWindow.tick(window)
+        self.assertEqual(submitted, [(42, ['90'])])
+        self.assertEqual(window.stale_history_ids, {42})
+        fresh = dict(fresh, recent_match_ids=['91'], recent_history_available=True)
+        events.append(dict(type='player_progress', scan_id=7, player_id=42, status='loading', data=old, partial_data=fresh))
+        ScoutWindow.tick(window)
+        self.assertEqual(submitted[-1], (42, ['91']))
+        self.assertEqual(window.stale_history_ids, set())
+        final = dict(fresh, recent_match_ids=[])
+        events.append(dict(type='player', scan_id=7, player_id=42, status='partial', data=old, partial_data=final))
+        ScoutWindow.tick(window)
+        self.assertEqual(submitted[-1], (42, []))
+
+
     def test_new_partial_history_replaces_stale_list_without_changing_old_statistics(self):
         window, pending, submitted = self.make_window()
         old = {'player_id': 42, 'core_ready': True, 'wins': 12,

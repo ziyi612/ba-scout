@@ -73,7 +73,12 @@ class UiLifecycleTests(unittest.TestCase):
         self.assertFalse(window.is_replay)
         window.report_button.config.assert_called_with(state="disabled")
         window.table.delete.assert_called_with("old-player")
-        window.table.insert.assert_not_called()
+        if phase == "waiting":
+            self.assertEqual([row.kwargs["iid"] for row in window.table.insert.call_args_list],
+                             [f"slot-{index}" for index in range(5)])
+            self.assertTrue(all(row.kwargs["values"][-1] == "等名字" for row in window.table.insert.call_args_list))
+        else:
+            window.table.insert.assert_not_called()
         for summary in (window.summary, window.summary20):
             self.assertEqual(summary["players"], [])
             self.assertEqual(summary["context"]["fight_id"], "未取得")

@@ -82,7 +82,10 @@ class PreparationUiTests(unittest.TestCase):
         self.assertFalse(window.is_replay)
         self.assertEqual([p["player_id"] for p in window.summary["players"]], [30, 31, 32])
         rendered = [call.kwargs["values"][0] for call in window.table.insert.call_args_list]
-        self.assertEqual(rendered, ["准备对手30", "准备对手31", "准备对手32"])
+        self.assertEqual(rendered, ["准备对手30", "准备对手31", "准备对手32", "对手 4", "对手 5"])
+        self.assertEqual([entry.kwargs["values"][-1] for entry in window.table.insert.call_args_list[-2:]],
+                         ["重名待确认", "等名字"])
+        window.show_view.assert_called_with("data")
         self.assertIn("3/5", window.status.set.call_args.args[0])
 
     def test_name_lookup_time_is_deducted_from_both_network_budgets(self):

@@ -19,6 +19,20 @@ def wait_until(predicate, timeout=1):
 
 
 class RequestPacingTests(unittest.TestCase):
+    def test_waiting_profile_precedes_queued_history_without_reordering_history(self):
+        gate = RequestGate(min_interval=.13)
+        calls = []
+        gate.run(calls.append, 'start')
+        threads = []
+        for label, background in [('history1', True), ('history2', True), ('profile', False)]:
+            worker = threading.Thread(target=gate.run, args=(calls.append, label), kwargs={'background': background})
+            worker.start()
+            threads.append(worker)
+            wait_until(lambda: len(gate._waiters) == len(threads))
+        for worker in threads:
+            worker.join(2)
+        self.assertEqual(calls, ['start', 'profile', 'history1', 'history2'])
+
     def test_shared_name_profile_history_starts_are_spaced_while_http_overlaps(self):
         interval = .04
         gate = RequestGate(min_interval=interval)

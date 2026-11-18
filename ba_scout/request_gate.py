@@ -13,12 +13,16 @@ from urllib.error import HTTPError
 _Result = TypeVar("_Result")
 
 
+class RequestCooldown(RuntimeError):
+    """A previous HTTP 429 is still blocking admission to the shared gate."""
+
+
 class RequestGate:
     """Space request starts while allowing admitted network calls to overlap.
 
     Calls accepted before a 429 may finish normally.  Later calls fail fast for
-    at least 60 seconds, without invoking their callable. Pacing uses a FIFO
-    admission queue, whose waits release the lock; a 429 also rejects callers
+    at least 60 seconds, without invoking their callable. Name/profile lookups
+    precede queued match pages, with FIFO order within each class. A 429 also rejects callers
     already waiting there. The gate never retries a request. A zero interval
     preserves the original immediate parallel-admission behavior.
 
@@ -41,12 +45,16 @@ class RequestGate:
         self._last_admitted = float('-inf')
         self._waiters = deque()
 
+    def cooldown_remaining(self) -> float:
+        with self._lock:
+            return max(0.0, self._cooldown_until - self._clock())
+
     def _check_cooldown_locked(self, now: float) -> None:
         remaining = self._cooldown_until - now
         if remaining > 0:
-            raise RuntimeError(f"数据站请求限流，请等待约 {math.ceil(remaining)} 秒后重试")
+            raise RequestCooldown(f"数据站请求限流，请等待约 {math.ceil(remaining)} 秒后重试")
 
-    def _admit(self, kwargs: dict) -> dict:
+    def _admit(self, kwargs: dict, background: bool) -> dict:
         if self.min_interval == 0:
             with self._lock:
                 self._check_cooldown_locked(self._clock())
@@ -56,10 +64,14 @@ class RequestGate:
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError('timeout must be positive and finite')
         ends = started + float(timeout)
-        ticket = object()
+        ticket = (background, object())
         with self._condition:
             self._check_cooldown_locked(self._clock())
-            self._waiters.append(ticket)
+            if background:
+                self._waiters.append(ticket)
+            else:
+                first_background = next((i for i, queued in enumerate(self._waiters) if queued[0]), len(self._waiters))
+                self._waiters.insert(first_background, ticket)
             try:
                 while True:
                     now = self._clock()
@@ -82,8 +94,8 @@ class RequestGate:
                 self._waiters.remove(ticket)
                 self._condition.notify_all()
 
-    def run(self, operation: Callable[..., _Result], *args, **kwargs) -> _Result:
-        kwargs = self._admit(kwargs)
+    def run(self, operation: Callable[..., _Result], *args, background: bool = False, **kwargs) -> _Result:
+        kwargs = self._admit(kwargs, background)
         # Check once more immediately before the callable: an in-flight HTTP
         # response may have set the shared cooldown during admission handoff.
         with self._lock:

@@ -62,7 +62,8 @@ class StreamingTests(unittest.TestCase):
         options.setdefault("lookup_budget", .8)
         options.setdefault("total_budget", 1.0)
         options.setdefault("capture_interval", .01)
-        controller = PrepController(ocr, RequestGate(), searcher=search or self.search,
+        gate = options.pop("request_gate", RequestGate())
+        controller = PrepController(ocr, gate, searcher=search or self.search,
                                     extractor=lambda frame, regions: frame, **options)
         self.controllers.append(controller)
         controller.start("LIVE-TEST", {})
@@ -383,10 +384,91 @@ class StreamingTests(unittest.TestCase):
             raise HTTPError("https://fixture.invalid/", 429, "rate limit", {}, None)
         ocr = ChangingOCR({0: "first"})
         controller = self.controller(ocr, search, concurrency=1)
-        self.wait(controller, lambda e: e["type"] == "resolved" and e["rows"][0]["status"] == "error")
+        self.wait(controller, lambda e: e["type"] == "resolved" and e["rows"][0]["status"] == "rate_limited")
         ocr.set({0: "first", 1: "second"})
-        self.wait(controller, lambda e: e["type"] == "resolved" and e["rows"][1]["status"] == "error")
+        self.wait(controller, lambda e: e["type"] == "resolved" and e["rows"][1]["status"] == "rate_limited")
         self.assertEqual(self.calls, ["first"])
+
+    def test_unchanged_names_resume_when_shared_cooldown_ends(self):
+        gate_time = [0.0]
+        gate = RequestGate(clock=lambda: gate_time[0])
+        calls = []
+
+        def search(name, timeout):
+            calls.append(name)
+            if len(calls) == 1:
+                raise HTTPError("https://fixture.invalid/", 429, "rate limit", {}, None)
+            return [{"id": 101, "name": name}]
+
+        controller = self.controller(ChangingOCR({0: "name1"}), search, request_gate=gate)
+        limited = self.wait(controller, lambda e: e["type"] == "resolved" and e["rows"][0]["status"] == "rate_limited")
+        self.assertGreater(limited["rows"][0]["resolution"]["retry_at"] - time.monotonic(), 59)
+        gate_time[0] = 59.0
+        time.sleep(.035)
+        self.assertEqual(calls, ["name1"])
+        gate_time[0] = 60.0
+        self.snapshot(controller, {101}, False)
+        self.assertEqual(calls, ["name1", "name1"])
+
+    def test_five_staggered_names_recover_one_unchanged_timed_out_row(self):
+        ocr = ChangingOCR({0: "name0"})
+        entered, release = self.barrier(), self.barrier()
+        attempts = Counter()
+
+        def search(name, timeout):
+            with self.call_lock:
+                attempts[name] += 1
+                first_slow_attempt = name == "name1" and attempts[name] == 1
+            if first_slow_attempt:
+                entered.set()
+                release.wait(2)
+                raise TimeoutError("first request timed out")
+            if name == "other-spelling":
+                return []
+            return [{"id": 100 + int(name[-1]), "name": name}]
+
+        names = {0: "name0"}
+        with patch("ba_scout.prep_engine._STREAM_RETRY_DELAY", .03):
+            controller = self.controller(ocr, search, lookup_budget=.35, total_budget=.55)
+            first = self.snapshot(controller, {100}, False)
+            names[1] = ["name1", "other-spelling"]
+            ocr.set(names)
+            self.assertTrue(entered.wait(.35))
+            names[2] = "name2"
+            ocr.set(names)
+            self.snapshot(controller, {100, 102}, False)
+            self.wait(controller, lambda e: e["type"] == "resolved" and e["rows"][1]["status"] == "timeout")
+            names[3] = "name3"
+            ocr.set(names)
+            self.snapshot(controller, {100, 102, 103}, False)
+            self.wait(controller, lambda e: e["type"] == "resolved" and e["rows"][1]["status"] == "retrying")
+            release.set()
+            recovered = self.snapshot(controller, {100, 101, 102, 103}, False)
+            self.assertGreater(recovered["player_deadlines"][101], first["initial_deadline"])
+            self.assertGreater(recovered["player_deadlines"][101], time.monotonic())
+            names[4] = "name4"
+            ocr.set(names)
+            full = self.snapshot(controller, set(range(100, 105)), True)
+
+        self.assertEqual(full["initial_deadline"], first["initial_deadline"])
+        self.assertEqual(attempts, Counter({"name0": 1, "name1": 2, "other-spelling": 1,
+                                            "name2": 1, "name3": 1, "name4": 1}))
+
+    def test_recovered_variant_with_second_exact_id_stays_ambiguous(self):
+        calls = Counter()
+        def search(name, timeout):
+            with self.call_lock:
+                calls[name] += 1
+                first = calls[name] == 1
+            if name == "second" and first:
+                raise TimeoutError("temporary")
+            return [{"id": 100 if name == "first" else 101, "name": name}]
+
+        with patch("ba_scout.prep_engine._STREAM_RETRY_DELAY", .03):
+            controller = self.controller(ChangingOCR({0: ["first", "second"]}), search)
+            self.wait(controller, lambda e: e["type"] == "resolved" and e["rows"][0]["status"] == "ambiguous")
+        self.assertFalse(any(e.get("players") for e in self.events))
+        self.assertEqual(calls, Counter({"first": 1, "second": 2}))
 
     def test_more_than_twelve_variants_blocks_entire_row_without_partial_search(self):
         def search(name, timeout):

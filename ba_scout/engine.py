@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError
+from .provider import profile_history, ranked_counts_available
 from .settings import app_path
 
 
@@ -40,7 +41,7 @@ def _fetched_profile(raw: Any, player_id: int) -> tuple[dict[str, Any], bool]:
     if (not isinstance(raw, dict) or type(raw.get('player_id')) is not int
             or raw['player_id'] != player_id):
         raise ValueError('战绩页面的玩家 ID 不匹配')
-    incomplete = raw.get('core_ready') is False
+    incomplete = raw.get('core_ready') is False or raw.get('profile_incomplete') is True
     if incomplete and raw.get('profile_incomplete') is not True:
         raise ValueError('战绩页面仅取得身份信息，核心统计尚未完整取得')
     data = dict(raw)
@@ -49,9 +50,20 @@ def _fetched_profile(raw: Any, player_id: int) -> tuple[dict[str, Any], bool]:
     return data, incomplete
 
 
-def _partial_message(has_old: bool) -> str:
-    return ('已取得本次基础资料和可用的近期对局编号；累计战绩暂缺'
-            + ('；累计统计仍显示旧缓存及其原始时间' if has_old else ''))
+def _partial_message(data: dict, has_old: bool) -> str:
+    missing = '双专精经验暂缺' if data.get('core_ready') else '累计战绩暂缺'
+    return ('已取得部分资料，' + missing
+            + ('；缺失字段可查看旧缓存及其原始时间' if has_old else ''))
+
+
+def _preserve_history(data: dict, old: dict | None) -> None:
+    if old is None or profile_history(data) is not None:
+        return
+    ids = profile_history(old)
+    if ids is not None:
+        data.update(recent_match_ids=ids, last_match_id=ids[0] if ids else None,
+                    recent_history_available=True, history_from_cache=True,
+                    history_fetched_at=old.get('history_fetched_at') or old.get('fetched_at'))
 
 
 @dataclass
@@ -72,6 +84,7 @@ class _Scan:
     deadlines: dict[int, float] = field(default_factory=dict)
     scheduled: set[int] = field(default_factory=set)
     responses: dict[int, dict[str, Any]] = field(default_factory=dict)
+    progress: dict[int, dict[str, Any]] = field(default_factory=dict)
     wake: threading.Event = field(default_factory=threading.Event)
     revision: int = 0
 
@@ -84,6 +97,8 @@ class _PrefetchRecord:
     stale: dict[str, Any] | None = None
     message: str = ''
     claimed_by: int | None = None
+    progress: dict | None = None
+    admitted: bool = False
 
 
 @dataclass
@@ -118,6 +133,8 @@ class ScanController:
         concurrency: int = 5,
         ttl: float = 600.0,
         min_profile_version: int = 1,
+        *,
+        stream_progress: bool = False,
     ) -> None:
         resolved = app_path(cache_dir)
         if not math.isfinite(deadline) or deadline <= 0:
@@ -131,6 +148,7 @@ class ScanController:
         resolved.mkdir(parents=True, exist_ok=True)
         self.cache_dir = resolved
         self.fetcher = fetcher
+        self.stream_progress = stream_progress
         self.deadline = float(deadline)
         self.concurrency = concurrency
         self.ttl = float(ttl)
@@ -460,6 +478,10 @@ class ScanController:
                         and player_id in scope.allowed_ids and self._prefetch_live_locked(scope)):
                     # A completed result is consumed once; an in-flight one
                     # publishes to this scan when done. Neither issues HTTP twice.
+                    record = scope.records[player_id]
+                    record.admitted = True
+                    if record.progress is not None:
+                        self._profile_progress_locked(scan, player_id, record.progress)
                     delivery = self._claim_prefetch_locked(scope, player_id)
                 else:
                     self._jobs.put((scan, player_id))
@@ -492,10 +514,39 @@ class ScanController:
                 if record.status == 'partial':
                     old = scan.stale.get(player_id, record.stale)
                     self._player_locked(scan, player_id, 'partial', old or record.data,
-                                        _partial_message(old is not None), partial_data=record.data)
+                                        _partial_message(record.data, old is not None), partial_data=record.data)
                 else:
                     data = record.data if record.status in {'ok', 'cached'} else scan.stale.get(player_id, record.stale)
                     self._player_locked(scan, player_id, record.status, data, record.message)
+
+    def _profile_progress_locked(self, scan: _Scan, player_id: int, data: dict) -> None:
+        if self._player_live_locked(scan, player_id):
+            scan.progress[player_id] = data
+            self._emit_locked(scan, {'type': 'player_progress', 'player_id': player_id,
+                                     'status': 'loading', 'data': scan.stale.get(player_id) or data,
+                                     'partial_data': data, 'message': '已取得部分字段，正在补充本次玩家资料'})
+
+    def _fetch_profile(self, owner: _Scan | _PrefetchScope, player_id: int, remaining: float):
+        timeout = min(12.0, remaining)
+        if not self.stream_progress:
+            return self.fetcher(player_id, timeout=timeout)
+
+        def publish(data):
+            if not isinstance(data, dict) or type(data.get('player_id')) is not int or data['player_id'] != player_id:
+                raise ValueError('流式玩家资料 ID 不匹配')
+            with self._lock:
+                if isinstance(owner, _PrefetchScope):
+                    if not self._prefetch_live_locked(owner) or player_id not in owner.records:
+                        return
+                    record = owner.records[player_id]
+                    record.progress = data
+                    if not record.admitted:
+                        return
+                    self._profile_progress_locked(owner.adopted, player_id, data)
+                else:
+                    self._profile_progress_locked(owner, player_id, data)
+
+        return self.fetcher(player_id, timeout=timeout, on_progress=publish)
 
     def _work_prefetch(self, scope: _PrefetchScope, player_id: int) -> None:
         """Borrow one existing worker; uncommitted results stay only in RAM."""
@@ -524,9 +575,10 @@ class ScanController:
                         cooldown = self._cooldown_until - time.monotonic()
                         if cooldown > 0:
                             raise RuntimeError(f'数据站请求限流，约 {math.ceil(cooldown)} 秒后可重试')
-                    raw = self.fetcher(player_id, timeout=min(12.0, remaining))
+                    raw = self._fetch_profile(scope, player_id, remaining)
                     data, incomplete = _fetched_profile(raw, player_id)
-                    status, message = (('partial', _partial_message(record.stale is not None)) if incomplete
+                    _preserve_history(data, record.stale)
+                    status, message = (('partial', _partial_message(data, record.stale is not None)) if incomplete
                                        else ('ok', '查询成功（已复用准备阶段预取）'))
             except Exception as exc:
                 error = str(exc).replace('\r', ' ').replace('\n', ' ')[:180] or type(exc).__name__
@@ -574,12 +626,13 @@ class ScanController:
                     self._player_locked(scan, player_id, "error", old, message)
                     continue
             try:
-                raw = self.fetcher(player_id, timeout=min(12.0, remaining))
+                raw = self._fetch_profile(scan, player_id, remaining)
                 data, incomplete = _fetched_profile(raw, player_id)
+                _preserve_history(data, scan.stale.get(player_id))
                 if incomplete:
                     with self._lock:
                         old = scan.stale.get(player_id)
-                        message = _partial_message(old is not None)
+                        message = _partial_message(data, old is not None)
                         if self._player_live_locked(scan, player_id):
                             self._player_locked(scan, player_id, 'partial', old or data,
                                                 message, partial_data=data)
@@ -630,6 +683,10 @@ class ScanController:
         if player_id in scan.terminal or player_id not in scan.members:
             return
         scan.terminal[player_id] = status
+        progress = scan.progress.pop(player_id, None)
+        if status in {'error', 'timeout'} and progress is not None:
+            partial_data = progress
+            data = data or progress
         response = {
                 "type": "player",
                 "player_id": player_id,
@@ -691,6 +748,13 @@ class ScanController:
             data["from_cache"] = True
             age = max(0.0, time.time() - stored_at)
             profile_version = data.get("profile_version", 1)
+            if self.min_profile_version >= 4 and profile_version == 3:
+                # Old profiles could claim "ready" with only wins. Empty
+                # lists also conflated missing fields with a genuine zero.
+                data['core_ready'] = ranked_counts_available(data.get('wins'), data.get('ranked_games'))
+                data['specs_available'] = isinstance(data.get('specs'), list) and bool(data['specs'])
+                if data['core_ready'] and data['specs_available'] and profile_history(data) is not None:
+                    profile_version = 4
             if not isinstance(profile_version, int) or profile_version < self.min_profile_version:
                 age = max(age, self.ttl + 1.0)
             return data, age

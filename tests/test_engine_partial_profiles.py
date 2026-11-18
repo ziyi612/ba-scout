@@ -58,6 +58,21 @@ class PartialProfileTests(unittest.TestCase):
         self.assertEqual(events[-1]['complete'], 0)
         self.assertFalse((self.path/'6.json').exists())
 
+    def test_successful_refresh_with_missing_history_preserves_original_list_and_timestamp_on_disk(self):
+        stamp, _ = self.stale_cache()
+        ctrl = self.controller(lambda pid, timeout: player_data(pid, core_ready=True,
+                               recent_match_ids=[], recent_history_available=False))
+        ctrl.start(roster(ids=[6]), 1)
+        events = wait_finished(ctrl)
+        fresh = next(e['data'] for e in events if e.get('status') == 'ok')
+        self.assertEqual(fresh['recent_match_ids'], ['80'])
+        self.assertEqual(fresh['history_fetched_at'], stamp)
+        self.assertTrue(fresh['history_from_cache'])
+        stored = json.loads((self.path/'6.json').read_text('utf-8'))['data']
+        self.assertEqual(stored['history_fetched_at'], stamp)
+        self.assertEqual(stored['recent_match_ids'], ['80'])
+
+
     def test_partial_refresh_keeps_old_stats_and_new_basic_fields_separate(self):
         stamp, original = self.stale_cache()
         ctrl = self.controller(lambda pid, timeout: partial_profile(pid))

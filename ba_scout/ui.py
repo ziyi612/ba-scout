@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from . import __version__
+
 import ctypes
 import datetime as dt
 import json
@@ -15,7 +17,7 @@ from tkinter import font as tkfont
 from .engine import ScanController
 from .labels import short_combo, combo_country
 from .metrics import profile_metrics, tied_top_count
-from .provider import fetch_player
+from .provider import fetch_player, profile_history
 from .scouting_engine import BattleRecon
 from .recon_provider import fetch_match
 from .request_gate import RequestGate
@@ -58,6 +60,48 @@ def record(data):
     return f"{number(data.get('wins'))}胜 / {number(data.get('losses'))}负 / {number(data.get('leaves'))}退"
 
 
+def overview_fields(state, player_id):
+    """Prefer each current field, keeping ratios within one dated profile."""
+    data = state.get("data") or {}
+    fresh = state.get("partial_data") or {}
+    mixed = bool(data.get("from_cache") and fresh.get("player_id") == player_id)
+    metrics = profile_metrics(data)
+    fields = {"rating": data.get("rating"), "rank": data.get("rank"), "specs": data.get("specs"),
+              "win_rate": metrics["win_rate"], "value_exchange": metrics["value_exchange"]}
+    if not mixed:
+        return fields, []
+
+    current = profile_metrics(fresh)
+    cached = []
+    for key, inputs in (("rating", ("rating",)), ("rank", ("rank",)),
+                        ("win_rate", ("wins", "ranked_games")),
+                        ("value_exchange", ("ranked_killed_value", "ranked_lost_value"))):
+        if all(fresh.get(item) is not None for item in inputs):
+            fields[key] = current[key] if key in current else fresh[key]
+        elif fields[key] is not None:
+            cached.append(key)
+    if fresh.get("specs_available") or fresh.get("specs"):
+        fields["specs"] = fresh.get("specs") or []
+    elif fields["specs"]:
+        cached.append("specs")
+    return fields, cached
+
+
+def prep_slot_status(row):
+    decision = row.get("resolution") or {}
+    status = decision.get("status") or row.get("status", "missing")
+    if status == "rate_limited" and decision.get("retry_at") is not None:
+        delay = max(0, decision["retry_at"] - time.monotonic())
+        ready = dt.datetime.now() + dt.timedelta(seconds=delay)
+        return "限流至\n" + ready.strftime("%H:%M:%S")
+    if status == "missing" and row.get("queryable"):
+        return "核对昵称"
+    return {"missing": "等名字", "searching": "查身份中", "retrying": "补查中",
+            "timeout": "查名超时", "rate_limited": "网站限流", "error": "查名失败",
+            "incomplete": "待核对", "conflict": "身份冲突", "ambiguous": "重名待确认",
+            "unmatched": "未匹配", "invalid": "昵称待校正"}.get(status, "待确认")
+
+
 def unit_label(unit, compact=False):
     name = unit.get('name') or f"单位 #{unit.get('id', '?')}"
     if compact:
@@ -97,7 +141,7 @@ class ScoutWindow:
         self.opening_view_seconds = 20
         self.stale_history_ids = set()
         self.analysis_mode = "opening"
-        self.view_mode = "summary"
+        self.view_mode = "data"
         self.summary = {}
         self.summary20 = {}
         self.catalog, self.catalog_note = self.load_tactical_catalog()
@@ -134,10 +178,12 @@ class ScoutWindow:
         self.selftest_results = []
         self.cache_dir = ROOT / ("work/ui-test-cache" if args.self_test else "data/cache")
         self.request_gate = RequestGate(min_interval=0.65)
-        self.controller = ScanController(str(self.cache_dir), self.fake_fetch if args.self_test else (lambda player_id, timeout: self.request_gate.run(fetch_player, player_id, timeout=timeout)),
-                                         deadline=max(0.1, config["deadline"] - 1.0), concurrency=config["concurrency"], ttl=config["cache_ttl"], min_profile_version=3)
+        self.controller = ScanController(str(self.cache_dir), self.fake_fetch if args.self_test else
+                                         (lambda player_id, **options: self.request_gate.run(fetch_player, player_id, **options)),
+                                         deadline=max(0.1, config["deadline"] - 1.0), concurrency=config["concurrency"],
+                                         ttl=config["cache_ttl"], min_profile_version=4, stream_progress=not args.self_test)
         self.recon = BattleRecon(str(ROOT / ("work/ui-scouting-cache-v06" if args.self_test else "data/scouting-matches")),
-                                 self.fake_match if args.self_test else (lambda match_id, timeout: self.request_gate.run(fetch_match, str(match_id), timeout=timeout)), concurrency=2)
+                                 self.fake_match if args.self_test else (lambda match_id, timeout: self.request_gate.run(fetch_match, str(match_id), timeout=timeout, background=True)), concurrency=2)
         try:
             self.watcher = LogWatcher(config["log_dir"], include_existing=False)
         except (OSError, ValueError) as exc:
@@ -160,7 +206,7 @@ class ScoutWindow:
             self.root.after(500, self.self_test_begin)
         else:
             self.root.after_idle(self.warmup_ocr)
-        logging.info("Application started version=0.7.4; log_dir=%s", config["log_dir"])
+        logging.info("Application started version=%s; log_dir=%s", __version__, config["log_dir"])
 
     def _build(self):
         self.row_font = tkfont.Font(root=self.root, family="Microsoft YaHei UI", size=9)
@@ -202,7 +248,7 @@ class ScoutWindow:
         self.summary_button = self.button(nav, "数据汇总", lambda: self.show_view("summary"))
         self.summary_button.pack(side="left", padx=(0, 6))
         self.enemy_button = self.button(nav, "对手  ·  5", lambda: self.show_players("enemy"))
-        self.enemy_button.pack(side="left", padx=(0, 6))
+        self.enemy_button.pack(side="left", before=self.summary_button, padx=(0, 6))
         self.ally_button = self.button(nav, "我方  ·  5", lambda: self.show_players("ally"))
         self.ally_button.pack(side="left")
         self.analysis_button = self.button(nav, "看整场出场", self.show_other_analysis)
@@ -257,7 +303,7 @@ class ScoutWindow:
         self.table.pack(fill="x")
         self.table.bind("<<TreeviewSelect>>", self.on_select)
         self.table.bind("<Double-1>", self.player_details)
-        self.detail_title = tk.StringVar(value="本局完整名单写入游戏日志后，这里会逐个显示查到的对手。")
+        self.detail_title = tk.StringVar(value="准备阶段将按游戏中的位置逐人显示对手。")
         self.detail_text = tk.StringVar(value="按 Ctrl+Alt+M 允许鼠标操作；按 Ctrl+Alt+B 展开或收起。\n专精经验反映历史积累，不能当作近期使用率或本场卡组。")
         tk.Label(self.data_panel, textvariable=self.detail_title, bg=BG, fg=CYAN, anchor="w",
                  font=("Microsoft YaHei UI", 9, "bold")).pack(fill="x", pady=(11, 3))
@@ -278,7 +324,7 @@ class ScoutWindow:
         # Reserve the recovery shortcuts before the expandable body takes space.
         self.footer.pack(side="bottom", fill="x", before=self.body)
         self.select_team("enemy")
-        self.show_view("summary")
+        self.show_view("data")
         self.update_summary()
 
     def load_tactical_catalog(self):
@@ -479,16 +525,18 @@ class ScoutWindow:
         if not units:
             return label + "\n窗口内无出场记录"
         fragments = []
-        budget = (int(self.table.column("recent", "width")) - 12 - self.row_font.measure("，")) / min(2, len(units))
+        budget = int(self.table.column("recent", "width")) - 12
         for unit in units[:2]:
-            name = unit_label(unit, True)
-            suffix = f" {unit['matches_with_unit']}/{count}"
+            name = unit_label(unit)
+            suffix = f" {unit['matches_with_unit']}/{count}局"
+            if self.row_font.measure(name + suffix) > budget:
+                name = unit_label(unit, True)
             shortened = False
             while len(name) > 1 and self.row_font.measure(name + ("…" if shortened else "") + suffix) > budget:
                 name = name[:-1]
                 shortened = True
             fragments.append(name + ("…" if shortened else "") + suffix)
-        return label + "\n" + "，".join(fragments)
+        return "\n".join(fragments)
 
     def opening_detail_lines(self, player_id, seconds=None):
         seconds = self.opening_view_seconds if seconds is None else seconds
@@ -528,7 +576,7 @@ class ScoutWindow:
 
     def render_rows(self):
         previous = str(self.selected_id) if self.selected_id else None
-        self.table.delete(*self.table.get_children())
+        existing = set(self.table.get_children())
         own = next((p["team"] for p in self.players if p["id"] == self.config["self_id"]),
                    getattr(self.current_roster, 'self_team', None))
         if own is None:
@@ -537,14 +585,31 @@ class ScoutWindow:
             selected = [p for p in self.players if (p["team"] != own) == (self.team_mode == "enemy")]
         self.enemy_button.config(text="Alpha · 阵营待核对" if own is None and self.players else "对手  ·  5")
         self.ally_button.config(text="Bravo · 阵营待核对" if own is None and self.players else "我方  ·  5")
-        self.table.config(height=min(5, max(5, len(selected))))
-        for player in selected:
+        source = getattr(self.current_roster, "source", None)
+        prep_slots = (self.team_mode == "enemy" and
+                      (source in {"screen_names", "manual_names"} or
+                       self.current_roster is None and getattr(self, "live_phase", None) == "waiting"))
+        if prep_slots:
+            by_slot = {p["index"]: p for p in selected if "index" in p}
+            rows = [by_slot.get(index) for index in range(5)]
+        else:
+            rows = selected
+        row_info = {r["index"]: r for r in getattr(self, "prep_rows", []) if r.get("team") == "Bravo"}
+        items = []
+        for index, player in enumerate(rows):
+            if player is None:
+                status = prep_slot_status(row_info.get(index, {}))
+                items.append((f"slot-{index}", (f"对手 {index + 1}", "—", "—", "—", "—", status), "pending"))
+                continue
             state = self.states.get(player["id"], {})
             status = state.get("status", "pending")
             data = state.get("data") or {}
-            labels = {"pending": "等待", "ok": "本次查询", "cached": "缓存", "stale": "旧缓存", "partial": "统计暂缺", "error": "查询失败", "timeout": "截止未完成"}
+            fields, cached = overview_fields(state, player["id"])
+            labels = {"pending": "查战绩中", "loading": "正在补充", "ok": "本次查询", "cached": "缓存",
+                      "stale": "旧缓存", "partial": "部分资料", "error": "查询失败",
+                      "timeout": "查询超时", "rate_limited": "网站限流"}
             name = player["name"] + (" · 我" if player["id"] == self.config["self_id"] else "")
-            combinations = data.get("specs") or []
+            combinations = fields["specs"] or []
             tied = tied_top_count(combinations)
             spec_rows = []
             for s in combinations[:2]:
@@ -553,10 +618,12 @@ class ScoutWindow:
                 suffix = "（并列）" if tied > 1 and s.get("experience") == combinations[0].get("experience") else ""
                 spec_rows.append(prefix + short_combo(s) + suffix)
             spec = "\n".join(spec_rows) or "—"
-            metrics = profile_metrics(data)
-            performance = f"胜率 {number(metrics.get('win_rate'), 1)}%\n交换 {number(metrics.get('value_exchange'), 2)}" if data else "—"
-            if data.get('core_ready') is False:
-                performance = "累计统计暂缺"
+            if spec_rows and "specs" in cached:
+                spec += "*"
+            win = number(fields["win_rate"], 1) + "%" if fields["win_rate"] is not None else "—"
+            exchange = number(fields["value_exchange"], 2)
+            performance = (f"胜率 {win}{'*' if 'win_rate' in cached else ''}\n"
+                           f"交换 {exchange}{'*' if 'value_exchange' in cached else ''}") if data else "—"
             recon = self.recon_states.get(player["id"], {})
             sample = recon.get("data") or {}
             if recon.get("status") == "ok":
@@ -573,9 +640,20 @@ class ScoutWindow:
             if data.get("from_cache") and status in ("error", "timeout", "partial"):
                 labels[status] = {"error": "旧缓存/失败", "timeout": "旧缓存/超时", "partial": "旧缓存/统计缺"}[status]
             tag = "error" if status in ("error", "timeout") else "stale" if status in ("stale", "partial") else "pending" if status == "pending" else ""
-            self.table.insert("", "end", iid=str(player["id"]), values=(name, number(data.get("rating")),
-                              performance, spec, recent_text, labels.get(status, status)), tags=(tag,))
-        if previous and self.table.exists(previous):
+            label = "*旧缓存" if cached else labels.get(status, status)
+            rating = number(fields["rating"]) + ("*" if "rating" in cached else "")
+            items.append((str(player["id"]), (name, rating, performance, spec, recent_text, label), tag))
+        desired = {iid for iid, _, _ in items}
+        for iid in existing - desired:
+            self.table.delete(iid)
+        for index, (iid, values, tag) in enumerate(items):
+            if iid in existing:
+                self.table.item(iid, values=values, tags=(tag,))
+                if self.table.index(iid) != index:
+                    self.table.move(iid, "", index)
+            else:
+                self.table.insert("", index, iid=iid, values=values, tags=(tag,))
+        if previous in desired:
             self.table.selection_set(previous)
         elif selected:
             self.table.selection_set(str(selected[0]["id"]))
@@ -584,6 +662,13 @@ class ScoutWindow:
     def on_select(self, event=None):
         selection = self.table.selection()
         if not selection:
+            return
+        if str(selection[0]).startswith("slot-"):
+            self.selected_id = None
+            index = int(selection[0][5:])
+            row = next((r for r in self.prep_rows if r.get("team") == "Bravo" and r.get("index") == index), {})
+            self.detail_title.set(f"对手 {index + 1} · {prep_slot_status(row)}")
+            self.detail_text.set((row.get("resolution") or {}).get("reason") or "等待本局该位置出现可确认的昵称。")
             return
         self.selected_id = int(selection[0])
         player = next(p for p in self.players if p["id"] == self.selected_id)
@@ -607,7 +692,7 @@ class ScoutWindow:
         if state.get("status") in ("stale", "error", "timeout", "partial"):
             line3 = ("旧缓存 · " if data.get('from_cache') else "") + state.get("message", "")
         if data.get('core_ready') is False:
-            line1 = f"评分 {number(data.get('rating'))} · 排名 {number(data.get('rank'))} · 累计战绩与专精统计暂缺"
+            line1 = f"评分 {number(data.get('rating'))} · 排名 {number(data.get('rank'))} · 部分累计字段暂缺"
         if self.analysis_mode == "opening" and self.selected_id in self.enemy_ids:
             opening = self.selected_opening_states().get(self.selected_id, {})
             summary = opening.get("data") or {}
@@ -619,11 +704,14 @@ class ScoutWindow:
             if count and not picks:
                 line2 = "有效样本在所选时间窗内没有出场记录。"
             line3 = "双击查看全部开局单位、首次出场时间和来源；上方按钮可切回整场出场。"
+        _, cached = overview_fields(state, self.selected_id)
+        if cached:
+            line3 = "* 标记的数据沿用 " + local_time(data.get("fetched_at")) + " 的缓存。"
         self.detail_text.set("\n".join([line1, line2, line3]))
 
     def player_details(self, event=None):
         selection = self.table.selection()
-        if not selection:
+        if not selection or str(selection[0]).startswith("slot-"):
             return
         player_id = int(selection[0])
         player = next(p for p in self.players if p["id"] == player_id)
@@ -643,18 +731,26 @@ class ScoutWindow:
                        relief="flat", padx=12, pady=12, wrap="word", yscrollcommand=scroll.set)
         text.pack(fill="both", expand=True)
         scroll.config(command=text.yview)
+        fields, cached = overview_fields(state, player_id)
         lines = [f"{player['name']}   ·   ID {player_id}   ·   {player['team']}", "",
-                 f"当前评分：{number(data.get('rating'), 1)}    排名：{number(data.get('rank'))}",
+                 f"当前评分：{number(fields['rating'], 1)}    排名：{number(fields['rank'])}",
                  f"排位累计：{record(data)}    网站统计场数：{number(data.get('ranked_games'))}",
                  f"本地抓取：{local_time(data.get('fetched_at'))}", f"网站统计更新：{local_time(data.get('stats_updated_at'))}",
                  f"状态：{state.get('message') or '等待查询'}", ""]
+        fresh = state.get("partial_data") or {}
+        if fresh.get("player_id") == player_id and data.get("from_cache"):
+            names = {"rating": "评分", "rank": "排名", "win_rate": "胜率", "value_exchange": "交换比", "specs": "专精"}
+            lines.insert(3, "本次基础资料时间 " + local_time(fresh.get("fetched_at")) +
+                         " · 原始累计记录时间 " + local_time(data.get("fetched_at")))
+            if cached:
+                lines.insert(4, "速览沿用缓存的字段：" + "、".join(names[key] for key in cached))
         opening_lines = self.opening_detail_lines(player_id, 20) + [""]
         if self.opening_window_seconds_active != 20:
             opening_lines += self.opening_detail_lines(player_id, self.opening_window_seconds_active) + [""]
         lines[2:2] = opening_lines
         metrics = profile_metrics(data)
-        lines.extend([f"排位总胜率：{number(metrics['win_rate'],1)}%（胜场 / 排位总场数，含退局）",
-                      f"排位价值交换比：{number(metrics['value_exchange'],2)}（摧毁价值 / 损失价值）",
+        lines.extend([f"排位总胜率：{number(fields['win_rate'],1)}%（胜场 / 排位总场数，含退局）",
+                      f"排位价值交换比：{number(fields['value_exchange'],2)}（摧毁价值 / 损失价值）",
                       f"排位单位数量 K/D：{number(metrics['unit_kd'],2)}（击杀个数 / 损失个数）",
                       f"排位退局率：{number(metrics['leave_rate'],1)}%（仅记录离开，不推断原因）",
                       metrics['nation_experience_line'], "国家经验不是国家使用率或胜率。", "",
@@ -673,9 +769,9 @@ class ScoutWindow:
         else:
             lines.append(recon.get("message") or "尚未取得；自动额外查询优先覆盖对手。")
         lines.extend(["", "历史双专精组合经验", "同经验为并列，列表次序不代表更常用；经验不是近期使用率。", ""])
-        for spec in data.get("specs") or []:
+        for spec in fields["specs"] or []:
             lines.append(f"{short_combo(spec)}：{number(spec.get('experience'))}  [{spec.get('label', spec.get('key'))}]")
-        if not data.get("specs"):
+        if not fields["specs"]:
             lines.append("暂无已取得的正经验组合。")
         lines.extend(["", "近期记录：快速查询未加载完整近期对局。" if data.get("recent_partial") else "近期记录以主窗口已取得数据为准。",
                       "", f"公开来源：https://dash.batrace.top/player/{player_id}"])
@@ -804,6 +900,11 @@ class ScoutWindow:
         self.opening20_states = {}
         if new_match:
             self.opening_view_seconds = 20
+            self.analysis_mode = "opening"
+            self.analysis_button.config(text="看整场出场")
+        if roster.source not in {"screen_names", "manual_names"}:
+            self.prep_streaming = False
+            self.prep_rows = []
         self.stale_history_ids = set()
         self.core_elapsed = None
         self.auto_report_attempted_scan_id = None
@@ -845,7 +946,7 @@ class ScoutWindow:
         self.compact.set(f"{prefix}  0/{len(roster.players)}")
         self.detail_title.set("正在查询公开战绩")
         self.detail_text.set("专精组合按历史经验排序；不会据此推断本场卡组。")
-        self.show_view("summary")
+        self.show_view("data")
         self.update_summary()
         if getattr(roster, 'source', '') in {'screen_names', 'manual_names'}:
             self.status.set(f'准备阶段 · 已匹配 {len(self.enemy_ids)}/5 名对手 · 姓名来源，等待游戏 ID 名单核对')
@@ -999,7 +1100,12 @@ class ScoutWindow:
             return
         if not self.expanded:
             self.toggle()
-        self.show_view('summary')
+        self.analysis_mode = "opening"
+        self.opening_view_seconds = 20
+        self.analysis_button.config(text="看整场出场")
+        self.table.heading("recent", text="开局记录 · 前20秒")
+        self.show_view("data")
+        self.select_team("enemy")
         if not self.config.get('prep_regions'):
             self.show_prep_state('已进入准备阶段 · 请点“准备识别”设置双方姓名位置；也可输入名字立即查询',
                                  '准备阶段 · 尚未设置姓名区域', '准备识别需要设置姓名区域')
@@ -1030,6 +1136,9 @@ class ScoutWindow:
         self.compact.set(compact)
         self.summary_heading.set(heading)
         self.summary_confidence.set(message)
+        if self.current_roster is None:
+            self.detail_title.set(heading)
+            self.detail_text.set(message)
         self.summary_text.config(state='normal')
         self.summary_text.delete('1.0', 'end')
         self.summary_text.insert('end', message + '\n\n')
@@ -1074,6 +1183,7 @@ class ScoutWindow:
                 self.scan_id = self.recon_scan_id = None
                 self.current_roster = None
                 self.players = self.enemy_ids = []
+                self.selected_id = None
                 self.states = {}
                 self.recon_states = {}
                 self.opening_states = {}
@@ -1082,7 +1192,7 @@ class ScoutWindow:
                 self.auto_report_path = self.last_export_path = None
                 self.report_scan_id = None
                 self.report_button.config(state='disabled')
-                self.render_rows()
+            self.render_rows()
             self.show_prep_state('准备阶段 · 持续读取尚未确认的对手；已变化或有歧义的身份不会沿用。',
                                  '准备阶段 · 等待明确身份', '准备名单 · 自动补识别中')
             return
@@ -1153,7 +1263,7 @@ class ScoutWindow:
         for row in event.get('rows') or []:
             decision = (row.get('resolution') or {}).get('status')
             if decision not in {'resolved', 'manual-confirmed', 'missing', 'ambiguous', 'not_found', 'unmatched', 'incomplete',
-                                'invalid', 'error', 'timeout', 'conflict'}:
+                                'invalid', 'error', 'timeout', 'conflict', 'searching', 'retrying', 'rate_limited'}:
                 decision = 'other'
             result_counts[decision] = result_counts.get(decision, 0) + 1
         players = event.get('players') or []
@@ -1309,24 +1419,33 @@ class ScoutWindow:
             elif hotkey == 102:
                 self.toggle_interact()
         changed = False
+        if getattr(self, 'history_scan_id', None) != self.recon_scan_id:
+            self.history_scan_id = self.recon_scan_id
+            self.submitted_histories = {}
         for event in self.controller.poll_events():
             if event.get("scan_id") != self.scan_id:
                 continue
-            if event["type"] == "player":
+            if event["type"] in ("player", "player_progress"):
                 if (getattr(self, 'prep_streaming', False) and
                         event['player_id'] not in {p['id'] for p in self.players}):
                     continue
                 self.states[event["player_id"]] = event
                 profile = event.get("partial_data") or event.get("data") or {}
-                if event.get("status") in ("ok", "cached", "stale", "partial") and profile and event["player_id"] in self.enemy_ids:
-                    history = profile.get("recent_match_ids") or ([profile["last_match_id"]] if profile.get("last_match_id") else [])
-                    if event.get("status") == "stale" or profile.get('from_cache'):
-                        self.stale_history_ids.add(event["player_id"])
-                    else:
-                        self.stale_history_ids.discard(event["player_id"])
-                    self.recon.submit_history(event["player_id"], history)
-                elif event['player_id'] in self.enemy_ids and event.get('status') in ('error', 'timeout', 'rate_limited') and not profile:
-                    self.recon.mark_unavailable(event['player_id'], event.get('message') or '未取得玩家战绩，无法读取最近对局编号')
+                if event['player_id'] in self.enemy_ids:
+                    history = profile_history(profile)
+                    if history is not None and (history or event["type"] == 'player'):
+                        if event.get("status") == "stale" or profile.get('from_cache') or profile.get('history_from_cache'):
+                            self.stale_history_ids.add(event["player_id"])
+                        else:
+                            self.stale_history_ids.discard(event["player_id"])
+                        signature = tuple(map(str, history))
+                        if self.submitted_histories.get(event["player_id"]) != signature:
+                            self.recon.submit_history(event["player_id"], history)
+                            self.submitted_histories[event["player_id"]] = signature
+                    elif (event['type'] == 'player' and event.get('status') != 'stale'
+                          and event['player_id'] not in self.submitted_histories):
+                        reason = event.get('message') if event.get('status') in ('error', 'timeout', 'rate_limited') else None
+                        self.recon.mark_unavailable(event['player_id'], reason or '本次玩家资料未返回近期对局清单')
                 changed = True
             elif event["type"] == "finished":
                 self.scanning = (getattr(self, 'prep_streaming', False) and
@@ -1470,7 +1589,7 @@ class ScoutWindow:
         time.sleep(0.08)
         return {"player_id": player_id, "name": f"测试玩家{player_id}", "rating": 2200 + player_id % 100,
                 "rank": 1200, "wins": 120, "losses": 90, "leaves": 3, "ranked_games": 213,
-                "profile_version": 3, "ranked_kills": 1000, "ranked_losses_units": 800,
+                "profile_version": 4, "ranked_kills": 1000, "ranked_losses_units": 800,
                 "ranked_killed_value": 120000, "ranked_lost_value": 100000, "ranked_duration_seconds": 600000,
                 "nation_experience": {"1":30000,"2":40000}, "last_match_id":"999999991", "recent_match_ids":["999999991", "999999992"],
                 "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(), "stats_updated_at": "2026-10-25T06:08:36+00:00",
@@ -1538,7 +1657,10 @@ class ScoutWindow:
         self._test_check("report_actions_fit_window", all(
             child.winfo_ismapped() and child.winfo_width() >= child.winfo_reqwidth()
             for child in self.report_button.master.winfo_children()))
-        self._test_check("summary_is_default_view", self.view_mode == "summary" and self.summary_panel.winfo_ismapped())
+        self._test_check("enemy_table_is_default_view", self.view_mode == "data" and self.data_panel.winfo_ismapped())
+        self.summary_button.invoke()
+        self.root.update_idletasks()
+        self._test_check("summary_view_available", self.summary_panel.winfo_ismapped())
         self._test_check("summary_catalog_or_missing_notice",
                          (self.catalog is not None and not self.catalog_note) or
                          (self.catalog is None and bool(self.catalog_note)))

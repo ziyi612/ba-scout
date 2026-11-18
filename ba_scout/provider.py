@@ -7,6 +7,8 @@ This module deliberately makes no extra match-detail requests or HTTP retries.
 
 from __future__ import annotations
 
+from . import __version__
+
 import codecs
 import json
 import math
@@ -15,13 +17,13 @@ import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from http.client import IncompleteRead
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.request import Request, urlopen
 
 
 BASE_URL = "https://dash.batrace.top"
 MAX_HTML_BYTES = 4 * 1024 * 1024
-USER_AGENT = "BA-Scout/0.7.4 (local public player statistics viewer)"
+USER_AGENT = f"BA-Scout/{__version__} (local public player statistics viewer)"
 
 
 class PlayerDataError(ValueError):
@@ -95,6 +97,18 @@ def _recent_match_ids(value: Any, limit: int = 5) -> list[str]:
 def _first_match_id(value: Any) -> str | None:
     ids = _recent_match_ids(value, 1)
     return ids[0] if ids else None
+
+
+def profile_history(profile: dict[str, Any]) -> list[str | int] | None:
+    """Distinguish a verified empty history from missing data in old/new profiles."""
+    values = profile.get("recent_match_ids")
+    ids = _recent_match_ids(values)
+    if ids and len(values) == len(ids) and all(str(value) == mid for value, mid in zip(values, ids)):
+        return list(values)
+    ids = ids or _recent_match_ids([profile.get("last_match_id")])
+    if ids or profile.get("recent_history_available") is True:
+        return ids
+    return None
 
 
 def _nation_experience(value: Any) -> dict[str, int | float]:
@@ -190,17 +204,9 @@ _STAT_NUMBERS = ("winCountRt", "lossCountRt", "leaveCountRt", "fightsCountRt",
                  "unitsLostCostRt", "matchDurationTimeSecRt")
 
 
-def _core_ready(stats: Any, expected_id: int) -> bool:
-    if not isinstance(stats, dict) or _integer(stats.get("playerId")) != expected_id:
-        return False
-    if any(_number(stats.get(key)) is not None and stats[key] >= 0 for key in _STAT_NUMBERS):
-        return True
-    for field, pattern in (("combinedSpecsExp", r"\d+_\d+"), ("nationExp", r"\d+")):
-        values = stats.get(field)
-        if isinstance(values, dict) and any(isinstance(key, str) and re.fullmatch(pattern, key)
-                and _number(value) is not None and value >= 0 for key, value in values.items()):
-            return True
-    return False
+def ranked_counts_available(wins: Any, games: Any) -> bool:
+    wins, games = _integer(wins), _integer(games)
+    return wins is not None and games is not None and 0 <= wins <= games
 
 
 def _updated_at(value: Any) -> str | None:
@@ -298,12 +304,12 @@ def parse_player_html(html: str, expected_id: int) -> dict[str, Any]:
                     candidate[field] = _model_value(candidate.get(field), models)
                 if isinstance(candidate.get("statInfo"), dict):
                     stats = dict(candidate["statInfo"])
-                    candidate["_stat_refs_pending"] = False
+                    candidate["_pending_fields"] = set()
                     for field in ("combinedSpecsExp", "nationExp"):
                         raw_value = stats.get(field)
                         stats[field] = _model_value(raw_value, models)
                         if isinstance(raw_value, str) and raw_value.startswith("$") and not isinstance(stats[field], dict):
-                            candidate["_stat_refs_pending"] = True
+                            candidate["_pending_fields"].add(field)
                     candidate["statInfo"] = stats
                 if isinstance(candidate.get("info"), dict):
                     candidates.append(candidate)
@@ -321,20 +327,41 @@ def parse_player_html(html: str, expected_id: int) -> dict[str, Any]:
         if candidates:
             raise PlayerDataError("BATrace returned a different player ID")
         raise _PlayerDataNotReady("BATrace player data was not found in the page")
-    # A streamed page can contain an early identity-only model followed by a
-    # complete profile model. Never let the first model hide later statistics.
+    # Profile models for this ID may arrive in pieces. Only verified numeric
+    # values and resolved containers can replace fields in earlier models.
+    info, stats, pending = {}, {}, set()
+    history = None
     for candidate in matching:
-        stats = candidate.get("statInfo")
-        if isinstance(stats, dict) and "playerId" in stats and _integer(stats["playerId"]) != expected_id:
+        model = candidate["info"]
+        for key, parse in (("name", _string), ("rating", _number), ("rank", _integer)):
+            value = parse(model.get(key))
+            if value is not None:
+                info[key] = value
+        source_ids = candidate.get("last_fights_data")
+        if isinstance(source_ids, list) and (not source_ids or _recent_match_ids(source_ids)):
+            history = source_ids
+        model = candidate.get("statInfo")
+        if not isinstance(model, dict) or "playerId" not in model:
+            continue
+        if _integer(model["playerId"]) != expected_id:
             raise PlayerDataError("BATrace profile and statistics player IDs disagree")
-    data = next((candidate for candidate in matching if _core_ready(candidate.get("statInfo"), expected_id)
-                 and not candidate.get("_stat_refs_pending")), matching[0])
-    info = data["info"]
-    stats = data.get("statInfo") if isinstance(data.get("statInfo"), dict) else {}
-    if "playerId" in stats and _integer(stats["playerId"]) != expected_id:
-        raise PlayerDataError("BATrace profile and statistics player IDs disagree")
+        stats["playerId"] = expected_id
+        for key in _STAT_NUMBERS:
+            value = _number(model.get(key)) if key.endswith(("CostRt", "SecRt")) else _integer(model.get(key))
+            if value is not None and value >= 0:
+                stats[key] = value
+        if _updated_at(model.get("updatedAt")):
+            stats["updatedAt"] = model["updatedAt"]
+        pending.update(candidate.get("_pending_fields", ()))
+        for key, pattern in (("combinedSpecsExp", r"\d+_\d+"), ("nationExp", r"\d+")):
+            values = model.get(key)
+            if isinstance(values, dict):
+                entries = {k: v for k, v in values.items()
+                           if isinstance(k, str) and re.fullmatch(pattern, k) and _number(v) is not None and v >= 0}
+                if not values or entries:
+                    stats.setdefault(key, {}).update(entries)
     return {
-        "profile_version": 3,
+        "profile_version": 4,
         "player_id": expected_id,
         "name": _string(info.get("name")),
         "rating": _number(info.get("rating")),
@@ -349,27 +376,32 @@ def parse_player_html(html: str, expected_id: int) -> dict[str, Any]:
         "ranked_lost_value": _number(stats.get("unitsLostCostRt")),
         "ranked_duration_seconds": _number(stats.get("matchDurationTimeSecRt")),
         "nation_experience": _nation_experience(stats.get("nationExp")),
-        "last_match_id": _first_match_id(data.get("last_fights_data")),
-        "recent_match_ids": _recent_match_ids(data.get("last_fights_data")),
+        "last_match_id": _first_match_id(history),
+        "recent_match_ids": _recent_match_ids(history),
+        "recent_history_available": history is not None,
         "stats_updated_at": _updated_at(stats.get("updatedAt")),
         "specs": _specializations(stats, spec_names),
-        "recent": _recent_matches(expected_id, data.get("last_fights_data"), match_map),
+        "recent": _recent_matches(expected_id, history, match_map),
         "source_url": f"{BASE_URL}/player/{expected_id}",
         "fetched_at": None,
         "fetch_seconds": None,
-        "core_ready": _core_ready(stats, expected_id) and not data.get("_stat_refs_pending", False),
+        "core_ready": ranked_counts_available(stats.get("winCountRt"), stats.get("fightsCountRt")),
+        "specs_available": "combinedSpecsExp" in stats,
+        "stats_pending": bool(pending - stats.keys()),
         "spec_names_available": bool(spec_names),
     }
 
 
-def fetch_player(player_id: int, timeout: float = 12.0) -> dict[str, Any]:
+def fetch_player(player_id: int, timeout: float = 12.0, *,
+                 on_progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
     """Fetch exactly one public player page. HTTP errors (including 429) propagate.
 
     ``timeout`` is urllib's network-operation timeout; the caller must enforce
     its own overall presentation deadline when fetching players concurrently.
     There are no retry, authentication, disk cache or follow-up match requests.
-    Return as soon as validated profile/statistics and the specialization-name
-    dictionary arrive.  ``recent_partial`` marks the intentionally unread tail;
+    Publish validated fields as complete models arrive. Return early once the
+    win-rate inputs, specializations and recent list have all been read.
+    ``recent_partial`` marks the intentionally unread tail;
     absent recent records in this mode do not mean the player has none.
     A validated identity-only model is returned as ``profile_incomplete`` at
     EOF or a truncated read. It is never a successful core-statistics result.
@@ -395,6 +427,7 @@ def fetch_player(player_id: int, timeout: float = 12.0) -> dict[str, Any]:
         script_tail = ""
         partial = False
         result = None
+        published = None
         read_warning = None
         while True:
             try:
@@ -433,13 +466,18 @@ def fetch_player(player_id: int, timeout: float = 12.0) -> dict[str, Any]:
                 candidate = parse_player_html(html, player_id)
             except _PlayerDataNotReady:
                 continue
-            if candidate["core_ready"] and candidate["spec_names_available"]:
+            if (candidate["core_ready"] and candidate["specs_available"] and candidate["spec_names_available"]
+                    and candidate["recent_history_available"] and not candidate["stats_pending"]):
                 result = candidate
                 partial = True
                 break
+            if on_progress is not None and candidate != published:
+                published = candidate
+                on_progress({**candidate, "profile_incomplete": True,
+                             "fetched_at": datetime.now(timezone.utc).isoformat()})
     result["partial_page"] = partial
     result["recent_partial"] = partial
-    result["profile_incomplete"] = not result["core_ready"]
+    result["profile_incomplete"] = not (result["core_ready"] and result["specs_available"])
     if read_warning:
         result["read_warning"] = read_warning
     result["fetched_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

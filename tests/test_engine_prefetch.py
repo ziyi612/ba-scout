@@ -26,6 +26,36 @@ def until(predicate, timeout=1):
 
 
 class PrefetchTests(unittest.TestCase):
+    def test_inflight_prefetch_progress_released_only_after_adoption_and_never_after_cancel(self):
+        first, next_chunk, done = threading.Event(), threading.Event(), threading.Event()
+        self.releases.extend([next_chunk, done])
+        def fetch(pid, timeout, on_progress):
+            on_progress(player_data(pid, recent_match_ids=['88'], core_ready=False))
+            first.set()
+            next_chunk.wait(2)
+            on_progress(player_data(pid, recent_match_ids=['89', '88'], core_ready=False))
+            done.set()
+            return player_data(pid)
+        ctrl = self.controller(fetch, stream_progress=True)
+        token = ctrl.begin_prefetch('100', time.monotonic() + 2)
+        ctrl.prefetch(token, 6)
+        self.assertTrue(first.wait(1))
+        self.assertEqual(ctrl.poll_events(), [])
+        scan = ctrl.start(roster(ids=[6]), 1, prefetch_token=token)
+        events = []
+        def adopted():
+            events.extend(ctrl.poll_events())
+            return any(e['type'] == 'player_progress' for e in events)
+        until(adopted)
+        progress = next(e for e in events if e['type'] == 'player_progress')
+        self.assertEqual((progress['scan_id'], progress['status'], progress['partial_data']['recent_match_ids']),
+                         (scan, 'loading', ['88']))
+        self.assertFalse(any(e['type'] == 'finished' for e in events))
+        ctrl.cancel()
+        next_chunk.set()
+        self.assertTrue(done.wait(1))
+        self.assertEqual(ctrl.poll_events(), [])
+
     def setUp(self):
         TEMP_ROOT.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix='profile-prefetch-', dir=TEMP_ROOT)
