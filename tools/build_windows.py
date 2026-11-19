@@ -81,7 +81,8 @@ def main():
     portable = output / 'BA-Scout'
     if not (portable / 'BA-Scout.exe').is_file():
         raise SystemExit('The expected executable was not produced.')
-    for name in ['LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md', 'data/prep-layout-default.json']:
+    for name in ['LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md', 'data/prep-layout-default.json',
+                 'docs/overlay-preview.png']:
         copy_file(ROOT / name, portable / name)
     # Never redistribute a locally supplied game-derived catalog. It is optional
     # for end users and its license is separate from this application's MIT code.

@@ -14,6 +14,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 
+from .dialog_style import FONT as DIALOG_FONT, configure_dialog, fill_reader, reader
 from .engine import ScanController
 from .labels import short_combo, combo_country
 from .metrics import profile_metrics, tied_top_count
@@ -27,13 +28,10 @@ from .roster import LogWatcher, Roster, parse_latest_roster, recent_roster
 from .settings import ROOT, atomic_json, f_path, read_path
 from .windows import Hotkeys, WM_HOTKEY, copy_file_to_clipboard, exercise_hotkey, root_handle, set_click_through, user32
 
-BG = "#111827"
-SURFACE = "#1b2638"
-FG = "#e8eef8"
-MUTED = "#9eafc8"
-CYAN = "#63dfcd"
-YELLOW = "#ffd285"
-RED = "#ff9f9f"
+from .roster_table import RosterTable
+from .theme import ACCENT, AMBER, BAR, BG, BORDER, DANGER, FG, FONT, MUTED, PRESSED, ROW_ALT, SELECTED, SURFACE
+
+CYAN, YELLOW, RED = ACCENT, AMBER, DANGER
 
 
 def number(value, decimals=0):
@@ -109,6 +107,15 @@ def unit_label(unit, compact=False):
         if model:
             return model.group(0)
     return name
+
+
+def style_observation_buttons(window):
+    whole_match = window.view_mode == "data" and window.analysis_mode == "recent"
+    for button, active in ((window.window20_button, not whole_match and window.opening_view_seconds == 20),
+                           (window.window_primary_button, not whole_match and window.opening_view_seconds != 20),
+                           (window.analysis_button, whole_match)):
+        inactive_bg = BG if button is window.analysis_button else SURFACE
+        button.configure(bg=ACCENT if active else inactive_bg, fg=BG if active else MUTED)
 
 
 class ScoutWindow:
@@ -197,7 +204,7 @@ class ScoutWindow:
         if not all(self.hotkey_ok):
             self.status.set("快捷键被占用，已保持鼠标可操作；可在设置中修改")
         elif self.watcher is None:
-            self.status.set("日志目录不可用，请按 Ctrl+Alt+M 后打开设置修改目录。")
+            self.status.set("日志目录不可用，请按 Ctrl+Alt+M，然后到“更多 → 设置”修改目录。")
         self.root.after(60, self.tick)
         self.root.after(400, self.poll_log)
         if args.replay_log:
@@ -209,119 +216,141 @@ class ScoutWindow:
         logging.info("Application started version=%s; log_dir=%s", __version__, config["log_dir"])
 
     def _build(self):
-        self.row_font = tkfont.Font(root=self.root, family="Microsoft YaHei UI", size=9)
+        self.row_font = tkfont.Font(root=self.root, family=FONT, size=-14)
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("Treeview", background=SURFACE, fieldbackground=SURFACE, foreground=FG,
-                        font=("Microsoft YaHei UI", 9), rowheight=46, borderwidth=0)
-        style.configure("Treeview.Heading", background="#26344b", foreground=MUTED,
-                        font=("Microsoft YaHei UI", 9), relief="flat")
-        style.map("Treeview", background=[("selected", "#304862")], foreground=[("selected", "white")])
-        style.map("Treeview.Heading", background=[("active", "#304862")])
-        self.outer = tk.Frame(self.root, bg=BG, highlightbackground="#3c526c", highlightthickness=1)
+        style.configure("Roster.Treeview", background=SURFACE, fieldbackground=SURFACE, foreground=FG,
+                        font=self.row_font, rowheight=43, borderwidth=0, relief="flat")
+        style.layout("Roster.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+        style.configure("Roster.Treeview.Heading", background=BAR, foreground=MUTED, borderwidth=0,
+                        relief="flat", padding=(3, 5), font=(FONT, -12, "bold"))
+        style.map("Roster.Treeview", background=[("selected", SELECTED)], foreground=[("selected", FG)])
+        style.map("Roster.Treeview.Heading", background=[("active", PRESSED)])
+        style.configure("Scout.Vertical.TScrollbar", background=BORDER, troughcolor=SURFACE,
+                        arrowcolor=MUTED, bordercolor=SURFACE, lightcolor=SURFACE, darkcolor=SURFACE)
+        self.outer = tk.Frame(self.root, bg=BG, highlightbackground=BORDER, highlightthickness=1)
         self.outer.pack(fill="both", expand=True)
-        self.bar = tk.Frame(self.outer, bg="#182338", height=45)
+        self.bar = tk.Frame(self.outer, bg=BAR, height=48)
         self.bar.pack(fill="x")
         self.bar.pack_propagate(False)
-        self.brand = tk.Label(self.bar, text="断箭  /  战前情报", bg="#182338", fg=FG,
-                              font=("Microsoft YaHei UI", 11, "bold"), padx=12)
-        self.brand.pack(side="left")
-        self.brand.bind("<ButtonPress-1>", self.drag_start)
-        self.brand.bind("<B1-Motion>", self.drag_move)
+        insignia = tk.Canvas(self.bar, width=30, height=30, bg=BAR, bd=0, highlightthickness=0)
+        insignia.pack(side="left", padx=(14, 8))
+        insignia.create_polygon(3, 22, 13, 5, 19, 5, 9, 22, fill=ACCENT, outline="")
+        insignia.create_polygon(13, 22, 20, 10, 27, 22, 22, 22, 20, 18, 18, 22, fill="#8ea776", outline="")
+        self.brand = tk.Label(self.bar, text="断箭战前情报", bg=BAR, fg=FG, font=(FONT, -19, "bold"))
+        self.brand.pack(side="left", padx=(0, 12))
         self.compact = tk.StringVar(value="等待新对局")
-        self.compact_label = tk.Label(self.bar, textvariable=self.compact, bg="#182338", fg=CYAN,
-                                      font=("Microsoft YaHei UI", 9), anchor="w")
-        self.compact_label.pack(side="left", fill="x", expand=True)
-        self.button(self.bar, "退出", self.close).pack(side="right", padx=(3, 8))
-        self.fold_button = self.button(self.bar, "收起", self.toggle)
-        self.fold_button.pack(side="right", padx=3)
+        self.compact_label = tk.Label(self.bar, textvariable=self.compact, bg=BAR, fg=ACCENT,
+                                      font=(FONT, -12), anchor="w")
+        self.close_button = self.button(self.bar, "退出", self.close, "quiet")
+        self.close_button.pack(side="right", padx=(2, 10))
+        self.fold_button = self.button(self.bar, "收起", self.toggle, "quiet")
+        self.fold_button.pack(side="right", padx=2)
         self.interact_button = self.button(self.bar, "", self.toggle_interact)
-        self.interact_button.pack(side="right", padx=3)
-        self.body = tk.Frame(self.outer, bg=BG, padx=12)
+        self.interact_button.pack(side="right", padx=(3, 6))
+        self.compact_label.pack(side="left", fill="x", expand=True)
+        for grip in (self.bar, insignia, self.brand, self.compact_label):
+            grip.bind("<ButtonPress-1>", self.drag_start)
+            grip.bind("<B1-Motion>", self.drag_move)
+
+        self.body = tk.Frame(self.outer, bg=BG, padx=14)
         self.body.pack(fill="both", expand=True)
-        self.status = tk.StringVar(value="监听已开启，准备阶段自动识别姓名并查询；后出现的对手会继续补齐。")
-        tk.Label(self.body, textvariable=self.status, bg=BG, fg=FG, anchor="w",
-                 font=("Microsoft YaHei UI", 9), wraplength=715, justify="left").pack(fill="x", pady=(12, 7))
         nav = tk.Frame(self.body, bg=BG)
-        nav.pack(fill="x", pady=(0, 8))
+        nav.pack(fill="x", pady=(10, 6))
         self.team_mode = "enemy"
-        self.summary_button = self.button(nav, "数据汇总", lambda: self.show_view("summary"))
-        self.summary_button.pack(side="left", padx=(0, 6))
         self.enemy_button = self.button(nav, "对手  ·  5", lambda: self.show_players("enemy"))
-        self.enemy_button.pack(side="left", before=self.summary_button, padx=(0, 6))
         self.ally_button = self.button(nav, "我方  ·  5", lambda: self.show_players("ally"))
-        self.ally_button.pack(side="left")
-        self.analysis_button = self.button(nav, "看整场出场", self.show_other_analysis)
-        self.analysis_button.pack(side="left", padx=(10, 0))
-        self.button(nav, "设置", self.settings_dialog).pack(side="right")
-        self.button(nav, "刷新本场", self.refresh).pack(side="right", padx=6)
-        self.button(nav, "测试上局", self.replay_latest).pack(side="right")
-        windows = tk.Frame(self.body, bg=BG)
-        windows.pack(fill="x", pady=(0, 6))
+        self.summary_button = self.button(nav, "数据汇总", lambda: self.show_view("summary"))
+        for control in (self.enemy_button, self.ally_button, self.summary_button):
+            control.pack(side="left", padx=(0, 3))
+        self.analysis_button = self.button(nav, "看整场出场", self.show_other_analysis, "quiet")
+        self.analysis_button.pack(side="right", padx=(6, 0))
+        windows = tk.Frame(nav, bg=BG)
+        windows.pack(side="right")
         self.window20_button = self.button(windows, "前20秒", lambda: self.select_opening_window(20))
-        self.window20_button.pack(side="left", padx=(0, 6))
+        self.window20_button.pack(side="left", padx=(0, 2))
         self.window_primary_button = self.button(windows, self.primary_window_label(),
                                                  lambda: self.select_opening_window(self.opening_window_seconds_active))
         self.window_primary_button.pack(side="left")
-        self.prep_button = self.button(windows, '准备识别', self.open_prep_dialog)
-        self.prep_button.pack(side='right')
-        tk.Label(windows, text="均从开局起算；TXT 含两段", bg=BG, fg=MUTED,
-                 font=("Microsoft YaHei UI", 8)).pack(side="left", padx=10)
+        self.status = tk.StringVar(value="正在监听游戏日志，准备阶段将自动读取名单。")
+        tk.Label(self.body, textvariable=self.status, bg=BG, fg=MUTED, anchor="w", font=(FONT, -13),
+                 wraplength=self.WIDTH-40, justify="left").pack(fill="x", pady=(1, 8))
+
         self.content = tk.Frame(self.body, bg=BG)
         self.content.pack(fill="both", expand=True)
         self.data_panel = tk.Frame(self.content, bg=BG)
         self.summary_panel = tk.Frame(self.content, bg=BG)
         self.summary_heading = tk.StringVar(value="对手开局数据汇总")
-        tk.Label(self.summary_panel, textvariable=self.summary_heading, bg=BG, fg=CYAN,
-                 font=("Microsoft YaHei UI", 12, "bold"), anchor="w", justify="left", wraplength=700).pack(fill="x")
-        self.summary_reason = tk.StringVar(value="类别按固定顺序列出；单位摘要按出现局数排序，全部名称见明细。")
-        tk.Label(self.summary_panel, textvariable=self.summary_reason, bg=BG, fg=FG,
-                 font=("Microsoft YaHei UI", 9), anchor="w", justify="left", wraplength=700).pack(fill="x", pady=(3, 6))
+        tk.Label(self.summary_panel, textvariable=self.summary_heading, bg=BG, fg=FG,
+                 font=(FONT, -18, "bold"), anchor="w", justify="left", wraplength=700).pack(fill="x")
+        self.summary_reason = tk.StringVar(value="类别按固定顺序列出；单位按出现局数排序。")
+        tk.Label(self.summary_panel, textvariable=self.summary_reason, bg=BG, fg=MUTED,
+                 font=(FONT, -13), anchor="w", justify="left", wraplength=700).pack(fill="x", pady=(3, 2))
         self.summary_confidence = tk.StringVar(value="")
         tk.Label(self.summary_panel, textvariable=self.summary_confidence, bg=BG, fg=MUTED,
-                 font=("Microsoft YaHei UI", 8), anchor="w", justify="left", wraplength=700).pack(fill="x", pady=(0, 5))
-        summary_body = tk.Frame(self.summary_panel, bg=BG)
+                 font=(FONT, -12), anchor="w", justify="left", wraplength=700).pack(fill="x", pady=(0, 8))
+        summary_body = tk.Frame(self.summary_panel, bg=BORDER, padx=1, pady=1)
         summary_body.pack(fill="both", expand=True)
-        summary_scroll = tk.Scrollbar(summary_body)
+        summary_scroll = ttk.Scrollbar(summary_body, orient="vertical", style="Scout.Vertical.TScrollbar")
         summary_scroll.pack(side="right", fill="y")
-        self.summary_text = tk.Text(summary_body, bg=SURFACE, fg=FG, relief="flat", wrap="word", height=10,
-                                   padx=10, pady=6, spacing3=2, font=("Microsoft YaHei UI", 9),
-                                   yscrollcommand=summary_scroll.set, cursor="arrow")
+        self.summary_text = tk.Text(summary_body, bg=SURFACE, fg=FG, relief="flat", highlightthickness=0,
+                                    wrap="word", height=8, padx=10, pady=6, spacing3=4, font=(FONT, -14),
+                                    yscrollcommand=summary_scroll.set, cursor="arrow")
         self.summary_text.pack(side="left", fill="both", expand=True)
         summary_scroll.config(command=self.summary_text.yview)
-        self.summary_text.tag_configure("label", foreground=CYAN, font=("Microsoft YaHei UI", 9, "bold"))
+        self.summary_text.tag_configure("label", foreground=ACCENT, font=(FONT, -14, "bold"))
         self.summary_text.config(state="disabled")
-        columns = ("name", "rating", "record", "spec", "recent", "status")
-        self.table = ttk.Treeview(self.data_panel, columns=columns, show="headings", height=5, selectmode="browse")
-        for key, label, width in [("name", "玩家", 122), ("rating", "评分", 48), ("record", "排位数据", 96),
-                                  ("spec", "历史专精经验", 175), ("recent", "开局记录 · " + self.opening_window_label(), 194), ("status", "状态", 65)]:
-            self.table.heading(key, text=label)
-            self.table.column(key, width=width, minwidth=width, stretch=(key == "spec"), anchor="w")
-        self.table.tag_configure("error", foreground=RED)
-        self.table.tag_configure("stale", foreground=YELLOW)
+
+        border = tk.Frame(self.data_panel, bg=BORDER, padx=1, pady=1)
+        border.pack(fill="x")
+        self.table = RosterTable(border, columns=("name", "rating", "record", "spec", "recent", "status"),
+                                 show="headings", height=5, selectmode="browse", style="Roster.Treeview")
+        for key, label, width in (("name", "玩家", 127), ("rating", "评分", 66), ("record", "排位表现", 99),
+                                  ("spec", "历史双专精", 146), ("recent", "开局记录 · " + self.opening_window_label(), 182),
+                                  ("status", "状态", 82)):
+            self.table.heading(key, text=label, anchor="w")
+            self.table.column(key, width=width, minwidth=width, stretch=(key == "recent"), anchor="w")
+        self.table.tag_configure("odd", background=ROW_ALT)
         self.table.tag_configure("pending", foreground=MUTED)
         self.table.pack(fill="x")
-        self.table.bind("<<TreeviewSelect>>", self.on_select)
+        self.table.bind("<<TreeviewSelect>>", self.on_select, add="+")
         self.table.bind("<Double-1>", self.player_details)
-        self.detail_title = tk.StringVar(value="准备阶段将按游戏中的位置逐人显示对手。")
-        self.detail_text = tk.StringVar(value="按 Ctrl+Alt+M 允许鼠标操作；按 Ctrl+Alt+B 展开或收起。\n专精经验反映历史积累，不能当作近期使用率或本场卡组。")
-        tk.Label(self.data_panel, textvariable=self.detail_title, bg=BG, fg=CYAN, anchor="w",
-                 font=("Microsoft YaHei UI", 9, "bold")).pack(fill="x", pady=(11, 3))
-        tk.Label(self.data_panel, textvariable=self.detail_text, bg=BG, fg=MUTED, anchor="nw", justify="left",
-                 font=("Microsoft YaHei UI", 9), wraplength=710, height=3).pack(fill="x")
+        self.table.bind("<<RosterActivate>>", self.player_details)
+        self.table.bind("<Return>", self.player_details)
+        self.detail_title = tk.StringVar(value="等待对手资料")
+        self.detail_text = tk.StringVar(value="选中玩家即可查看该位置的样本与来源，双击查看完整型号。")
+        detail = tk.Frame(self.data_panel, bg=SURFACE)
+        detail.pack(fill="both", expand=True, pady=(9, 0))
+        tk.Frame(detail, bg=BORDER, width=3).pack(side="left", fill="y")
+        detail_copy = tk.Frame(detail, bg=SURFACE)
+        detail_copy.pack(side="left", fill="both", expand=True, padx=10, pady=5)
+        tk.Label(detail_copy, textvariable=self.detail_title, bg=SURFACE, fg=FG, anchor="w",
+                 font=(FONT, -14, "bold")).pack(fill="x")
+        tk.Label(detail_copy, textvariable=self.detail_text, bg=SURFACE, fg=MUTED, anchor="nw", justify="left",
+                 font=(FONT, -13), wraplength=self.WIDTH-65).pack(fill="both", expand=True)
+
         lower = tk.Frame(self.body, bg=BG)
-        lower.pack(side="bottom", fill="x", pady=(8, 9), before=self.content)
-        self.button(lower, "复制所选来源", self.copy_source).pack(side="right")
-        self.export_button = self.button(lower, "导出完整 TXT", self.export_report)
-        self.export_button.pack(side="right", padx=(0, 6))
-        self.report_button = self.button(lower, "打开战前报告", self.open_report)
+        lower.pack(side="bottom", fill="x", pady=(9, 10), before=self.content)
+        self.report_button = self.button(lower, "打开战前报告", self.open_report, "primary")
         self.report_button.pack(side="left", padx=(0, 6))
         self.report_button.config(state="disabled")
-        self.button(lower, "复制数据汇总", self.copy_summary).pack(side="left")
-        self.button(lower, "全部单位 / 来源", self.summary_details).pack(side="left", padx=(6, 0))
-        self.footer = tk.Label(self.outer, text="", bg="#182338", fg=MUTED,
-                               font=("Microsoft YaHei UI", 8), anchor="w", padx=12, pady=6)
-        # Reserve the recovery shortcuts before the expandable body takes space.
+        self.export_button = self.button(lower, "导出完整 TXT", self.export_report)
+        self.export_button.pack(side="left")
+        self.button(lower, "全部单位 / 来源", self.summary_details, "quiet").pack(side="left", padx=5)
+        self.more_button = tk.Menubutton(lower, text="更多 ▾", bg=SURFACE, fg=FG, activebackground=PRESSED,
+                                         activeforeground=FG, relief="flat", bd=0, cursor="hand2", takefocus=True,
+                                         padx=10, pady=4, font=(FONT, -13))
+        menu = tk.Menu(self.more_button, tearoff=False)
+        for label, command in (("刷新本场", self.refresh), ("测试上局", self.replay_latest),
+                               ("复制所选来源", self.copy_source), ("复制数据汇总", self.copy_summary),
+                               ("设置", self.settings_dialog)):
+            menu.add_command(label=label, command=command)
+        self.more_button.configure(menu=menu)
+        self.more_button.pack(side="right")
+        self.prep_button = self.button(lower, "准备识别", self.open_prep_dialog, "quiet")
+        self.prep_button.pack(side="right", padx=5)
+        self.footer = tk.Label(self.outer, text="", bg=BAR, fg=MUTED,
+                               font=(FONT, -12), anchor="w", padx=14, pady=4)
         self.footer.pack(side="bottom", fill="x", before=self.body)
         self.select_team("enemy")
         self.show_view("data")
@@ -351,7 +380,12 @@ class ScoutWindow:
         self.summary_panel.pack_forget()
         panel = self.summary_panel if mode == "summary" else self.data_panel
         panel.pack(fill="both", expand=True)
-        self.summary_button.config(bg="#27616a" if mode == "summary" else "#2a3a50")
+        style_observation_buttons(self)
+        self.summary_button.config(bg=SELECTED if mode == "summary" else SURFACE,
+                                   fg=ACCENT if mode == "summary" else MUTED)
+        for team, button in (("enemy", self.enemy_button), ("ally", self.ally_button)):
+            selected = mode == "data" and team == self.team_mode
+            button.config(bg=SELECTED if selected else SURFACE, fg=ACCENT if selected else MUTED)
 
     def show_players(self, team):
         self.show_view("data")
@@ -376,9 +410,8 @@ class ScoutWindow:
         active = self.summary20 if self.opening_view_seconds == 20 else self.summary
         samples = sum((state.get("data") or {}).get("sample_count", 0) > 0 for state in self.selected_opening_states().values())
         self.summary_heading.set(f"对手开局{self.opening_window_label()} · {samples}/{len(self.enemy_ids)}人有有效样本")
-        self.window20_button.config(bg="#27616a" if self.opening_view_seconds == 20 else "#2a3a50")
-        self.window_primary_button.config(text=self.primary_window_label(),
-                                         bg="#27616a" if self.opening_view_seconds != 20 else "#2a3a50")
+        style_observation_buttons(self)
+        self.window_primary_button.config(text=self.primary_window_label())
         if self.opening_window_seconds_active == 20:
             self.window_primary_button.pack_forget()
         elif not self.window_primary_button.winfo_manager():
@@ -414,27 +447,23 @@ class ScoutWindow:
     def summary_details(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("完整开局统计与来源")
-        dialog.configure(bg=BG)
+        configure_dialog(dialog)
         dialog.attributes("-topmost", True)
         dialog.geometry("720x600")
-        pane = tk.Frame(dialog, bg=BG)
-        pane.pack(fill="both", expand=True, padx=12, pady=12)
-        scroll = tk.Scrollbar(pane)
-        scroll.pack(side="right", fill="y")
-        text = tk.Text(pane, bg=SURFACE, fg=FG, wrap="word", font=("Microsoft YaHei UI", 10),
-                       padx=12, pady=12, yscrollcommand=scroll.set)
-        text.pack(fill="both", expand=True)
-        scroll.config(command=text.yview)
-        text.insert("1.0", self.combined_summary_text())
-        text.config(state="disabled")
-        self.button(dialog, "关闭", dialog.destroy).pack(pady=(0, 10))
+        fill_reader(reader(dialog), self.combined_summary_text())
+        ttk.Button(dialog, text="关闭", command=dialog.destroy, style="BA.TButton").pack(
+            anchor="e", padx=14, pady=(0, 10))
         return dialog
 
     @staticmethod
-    def button(parent, text, command):
-        return tk.Button(parent, text=text, command=command, bg="#2a3a50", fg=FG,
-                         activebackground="#3a536d", activeforeground="white", relief="flat", bd=0,
-                         font=("Microsoft YaHei UI", 9), padx=9, pady=4, cursor="hand2", takefocus=False)
+    def button(parent, text, command, tone="default"):
+        bg, fg = ((SELECTED, ACCENT) if tone == "primary" else
+                  (parent.cget("background"), MUTED) if tone == "quiet" else (SURFACE, FG))
+        return tk.Button(parent, text=text, command=command, bg=bg, fg=fg,
+                         activebackground=PRESSED, activeforeground=FG, disabledforeground=MUTED,
+                         relief="flat", overrelief="flat", bd=0, highlightthickness=0,
+                         font=(FONT, -13, "bold" if tone == "primary" else "normal"),
+                         padx=10, pady=4, cursor="hand2", takefocus=True)
 
     def _position(self):
         screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -481,8 +510,9 @@ class ScoutWindow:
 
     def select_team(self, mode):
         self.team_mode = mode
-        self.enemy_button.config(bg="#296b65" if mode == "enemy" else "#2a3a50")
-        self.ally_button.config(bg="#296b65" if mode == "ally" else "#2a3a50")
+        for team, button in (("enemy", self.enemy_button), ("ally", self.ally_button)):
+            selected = team == mode and self.view_mode == "data"
+            button.config(bg=SELECTED if selected else SURFACE, fg=ACCENT if selected else MUTED)
         self.render_rows()
 
     def opening_window_label(self):
@@ -507,7 +537,8 @@ class ScoutWindow:
 
     def toggle_analysis(self):
         self.analysis_mode = "recent" if self.analysis_mode == "opening" else "opening"
-        self.analysis_button.config(text="看开局记录" if self.analysis_mode == "recent" else "看整场出场")
+        style_observation_buttons(self)
+        self.analysis_button.config(text="整场出场" if self.analysis_mode == "recent" else "看整场出场")
         self.table.heading("recent", text="最近1场出场" if self.analysis_mode == "recent" else "开局记录 · " + self.opening_window_label())
         self.render_rows()
 
@@ -647,12 +678,17 @@ class ScoutWindow:
         for iid in existing - desired:
             self.table.delete(iid)
         for index, (iid, values, tag) in enumerate(items):
+            tags = tuple(filter(None, (tag, "odd" if index % 2 else None)))
             if iid in existing:
-                self.table.item(iid, values=values, tags=(tag,))
+                self.table.item(iid, values=values, tags=tags)
                 if self.table.index(iid) != index:
                     self.table.move(iid, "", index)
             else:
-                self.table.insert("", index, iid=iid, values=values, tags=(tag,))
+                self.table.insert("", index, iid=iid, values=values, tags=tags)
+        if isinstance(self.table, RosterTable):
+            self.table.schedule_paint()
+            empty = "该阵营暂无已确认的玩家" if self.players else "等待本场名单"
+            self.table.show_empty("" if items else empty)
         if previous in desired:
             self.table.selection_set(previous)
         elif selected:
@@ -719,18 +755,11 @@ class ScoutWindow:
         data = state.get("data") or {}
         dialog = tk.Toplevel(self.root)
         dialog.title(f"玩家详情 · {player['name']}")
-        dialog.configure(bg=BG)
+        configure_dialog(dialog)
         dialog.attributes("-topmost", True)
         dialog.geometry("690x570")
         dialog.transient(self.root)
-        pane = tk.Frame(dialog, bg=BG)
-        pane.pack(fill="both", expand=True, padx=14, pady=14)
-        scroll = tk.Scrollbar(pane)
-        scroll.pack(side="right", fill="y")
-        text = tk.Text(pane, bg=SURFACE, fg=FG, insertbackground=FG, font=("Microsoft YaHei UI", 10),
-                       relief="flat", padx=12, pady=12, wrap="word", yscrollcommand=scroll.set)
-        text.pack(fill="both", expand=True)
-        scroll.config(command=text.yview)
+        text = reader(dialog)
         fields, cached = overview_fields(state, player_id)
         lines = [f"{player['name']}   ·   ID {player_id}   ·   {player['team']}", "",
                  f"当前评分：{number(fields['rating'], 1)}    排名：{number(fields['rank'])}",
@@ -775,9 +804,9 @@ class ScoutWindow:
             lines.append("暂无已取得的正经验组合。")
         lines.extend(["", "近期记录：快速查询未加载完整近期对局。" if data.get("recent_partial") else "近期记录以主窗口已取得数据为准。",
                       "", f"公开来源：https://dash.batrace.top/player/{player_id}"])
-        text.insert("1.0", "\n".join(lines))
-        text.config(state="disabled")
-        self.button(dialog, "关闭", dialog.destroy).pack(pady=(0, 12))
+        fill_reader(text, "\n".join(lines))
+        ttk.Button(dialog, text="关闭", command=dialog.destroy, style="BA.TButton").pack(
+            anchor="e", padx=14, pady=(0, 10))
         return dialog
 
     def copy_source(self):
@@ -875,19 +904,11 @@ class ScoutWindow:
         dialog = tk.Toplevel(self.root)
         dialog.title(f"战前报告 · {'历史回放' if self.is_replay else '本局'} {self.current_roster.fight_id}")
         dialog.geometry("800x680")
-        dialog.configure(bg=BG)
+        configure_dialog(dialog)
         dialog.attributes("-topmost", True)
-        pane = tk.Frame(dialog, bg=BG)
-        pane.pack(fill="both", expand=True, padx=12, pady=12)
-        scroll = tk.Scrollbar(pane)
-        scroll.pack(side="right", fill="y")
-        content = tk.Text(pane, bg=SURFACE, fg=FG, wrap="word", font=("Microsoft YaHei UI", 10),
-                          padx=12, pady=12, yscrollcommand=scroll.set)
-        content.pack(fill="both", expand=True)
-        scroll.config(command=content.yview)
-        content.insert("1.0", path.read_text(encoding="utf-8-sig"))
-        content.config(state="disabled")
-        self.button(dialog, "关闭报告", dialog.destroy).pack(pady=(0, 10))
+        fill_reader(reader(dialog), path.read_text(encoding="utf-8-sig"))
+        ttk.Button(dialog, text="关闭报告", command=dialog.destroy, style="BA.TButton").pack(
+            anchor="e", padx=14, pady=(0, 10))
         return dialog
 
     def start_scan(self, roster, replay=False, force=False, *, budget_seconds=None, started_at=None, prefetch_token=None):
@@ -1529,19 +1550,22 @@ class ScoutWindow:
         self.set_passthrough(False)
         dialog = tk.Toplevel(self.root)
         dialog.title("断箭战前情报 · 设置")
-        dialog.configure(bg=BG)
+        configure_dialog(dialog)
         dialog.attributes("-topmost", True)
         dialog.resizable(False, False)
         entries = {}
         for row, (key, title) in enumerate([( "self_id", "自己的数字玩家 ID"), ("log_dir", "游戏日志目录（GameLogs）"),
                                            ("hotkey_toggle", "展开 / 收起快捷键"), ("hotkey_interact", "切换鼠标操作快捷键"),
                                            ("opening_window_seconds", "第二观察窗（10–300秒；另有固定20秒）"), ("opening_history_limit", "每人样本上限（1–5局）")]):
-            tk.Label(dialog, text=title, bg=BG, fg=FG, font=("Microsoft YaHei UI", 9)).grid(row=row, column=0, sticky="w", padx=12, pady=9)
+            gap = (16, 5) if row in (0, 2, 4) else (5, 5)
+            ttk.Label(dialog, text=title, style="BA.TLabel").grid(row=row, column=0, sticky="w", padx=(18, 9), pady=gap)
             value = tk.StringVar(value=str(self.config[key]))
-            tk.Entry(dialog, textvariable=value, width=55, font=("Microsoft YaHei UI", 9)).grid(row=row, column=1, padx=12, pady=9)
+            ttk.Entry(dialog, textvariable=value, width=46, font=DIALOG_FONT, style="BA.TEntry").grid(
+                row=row, column=1, sticky="ew", padx=(6, 18), pady=gap)
             entries[key] = value
         note = tk.StringVar(value="请填写你自己的数字玩家 ID。配置、缓存、截图和报告保存在软件目录内。")
-        tk.Label(dialog, textvariable=note, bg=BG, fg=YELLOW, wraplength=600).grid(row=6, column=0, columnspan=2, padx=12, pady=10)
+        ttk.Label(dialog, textvariable=note, style="Muted.BA.TLabel", wraplength=600).grid(
+            row=6, column=0, columnspan=2, sticky="w", padx=18, pady=(12, 6))
 
         def save():
             from .windows import parse_hotkey
@@ -1577,7 +1601,8 @@ class ScoutWindow:
             except Exception as exc:
                 note.set(str(exc))
 
-        self.button(dialog, "保存", save).grid(row=7, column=1, sticky="e", padx=12, pady=12)
+        ttk.Button(dialog, text="保存", command=save, style="Primary.BA.TButton").grid(
+            row=7, column=1, sticky="e", padx=18, pady=(4, 14))
         dialog.transient(self.root)
 
     def callback_error(self, exc_type, exc, tb):

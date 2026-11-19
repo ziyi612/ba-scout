@@ -7,7 +7,9 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 from pathlib import Path
 
+from .dialog_style import FONT, configure_dialog
 from .settings import ROOT, atomic_json, f_path
+from .theme import ACCENT, BG
 
 
 class PrepDialog:
@@ -15,49 +17,55 @@ class PrepDialog:
         self.owner = owner
         self.root = tk.Toplevel(owner.root)
         self.root.title('准备阶段 · 名单识别与校正')
-        self.root.geometry('940x760')
+        self.root.geometry(f'940x{min(720, self.root.winfo_screenheight() - 80)}')
+        configure_dialog(self.root)
         self.root.attributes('-topmost', True)
         self.note = tk.StringVar(value='已附带常见地图投票界面位置；布局不同时请重新框选。已识别名字可在这里校正；同名候选需要你明确选择。')
-        tk.Label(self.root, textvariable=self.note, wraplength=900, justify='left', anchor='w').pack(fill='x', padx=12, pady=10)
-        tabs = ttk.Notebook(self.root)
-        tabs.pack(fill='both', expand=True, padx=12, pady=6)
-        names = ttk.Frame(tabs)
-        regions = ttk.Frame(tabs)
+        ttk.Label(self.root, textvariable=self.note, style='Muted.BA.TLabel', wraplength=900,
+                  justify='left', anchor='w').pack(fill='x', padx=16, pady=(14, 5))
+        tabs = ttk.Notebook(self.root, style='BA.TNotebook')
+        tabs.pack(fill='both', expand=True, padx=14, pady=8)
+        names = ttk.Frame(tabs, style='BA.TFrame', padding=(12, 6))
+        regions = ttk.Frame(tabs, style='BA.TFrame', padding=(8, 5))
         tabs.add(names, text='名单校正 / 手动查询')
         tabs.add(regions, text='设置自动识别区域')
         self.entries = {}
         self.selectors = {}
         self.candidates = {}
-        tk.Label(names, text='我方 / 对方由你框选的区域决定。留空的人显示缺失；搜索同名时请选对数字 ID。',
-                 wraplength=850, justify='left').grid(row=0, column=0, columnspan=3, sticky='w', padx=8, pady=8)
+        ttk.Label(names, style='BA.TLabel', text='我方 / 对方由你框选的区域决定。留空的人显示缺失；搜索同名时请选对数字 ID。',
+                  wraplength=850, justify='left').grid(row=0, column=0, columnspan=3, sticky='w', padx=4, pady=(6, 10))
         for team_index, team in enumerate(('Bravo', 'Alpha')):
             for index in range(5):
                 row = 1 + team_index * 5 + index
-                tk.Label(names, text=f"{'对手' if team == 'Bravo' else '我方'} {index + 1}").grid(row=row, column=0, padx=8, pady=5)
+                gap = (11, 2) if team == 'Alpha' and index == 0 else (2, 2)
+                ttk.Label(names, style='BA.TLabel', text=f"{'对手' if team == 'Bravo' else '我方'} {index + 1}").grid(
+                    row=row, column=0, sticky='w', padx=(4, 12), pady=gap)
                 value = tk.StringVar()
-                tk.Entry(names, textvariable=value, width=29).grid(row=row, column=1, padx=6, sticky='ew')
-                choice = ttk.Combobox(names, state='readonly', width=45)
-                choice.grid(row=row, column=2, padx=6, sticky='ew')
+                ttk.Entry(names, textvariable=value, width=29, font=FONT, style='BA.TEntry').grid(
+                    row=row, column=1, padx=(0, 8), pady=gap, sticky='ew')
+                choice = ttk.Combobox(names, state='readonly', width=45, font=FONT, style='BA.TCombobox')
+                choice.grid(row=row, column=2, padx=(0, 4), pady=gap, sticky='ew')
                 self.entries[team, index] = value
                 self.selectors[team, index] = choice
                 self.candidates[team, index] = {}
                 value.trace_add('write', lambda *_, selected=choice: selected.set(''))
         names.columnconfigure(1, weight=1)
         names.columnconfigure(2, weight=1)
-        tk.Button(names, text='按以上名单查询', command=self.query_names).grid(row=11, column=0, columnspan=3, pady=12)
-        tk.Label(names, text='这里查询的是已结束对局的历史记录。姓名匹配后会标注来源，正式游戏 ID 名单出现后再核对。',
-                 wraplength=850, justify='left').grid(row=12, column=0, columnspan=3, padx=8, pady=8)
-        bar = tk.Frame(regions)
+        ttk.Button(names, style='Primary.BA.TButton', text='按以上名单查询', command=self.query_names).grid(
+            row=11, column=0, columnspan=3, sticky='e', padx=4, pady=(12, 6))
+        ttk.Label(names, style='Muted.BA.TLabel', text='这里查询的是已结束对局的历史记录。姓名匹配后会标注来源，正式游戏 ID 名单出现后再核对。',
+                  wraplength=850, justify='left').grid(row=12, column=0, columnspan=3, sticky='w', padx=4, pady=6)
+        bar = ttk.Frame(regions, style='BA.TFrame')
         bar.pack(fill='x', pady=6)
-        tk.Button(bar, text='读取当前游戏画面', command=self.capture).pack(side='left', padx=4)
-        tk.Button(bar, text='载入已有截图', command=self.load_image).pack(side='left', padx=4)
-        tk.Button(bar, text='依次框 5 个对手名字', command=lambda: self.begin('Bravo')).pack(side='left', padx=4)
-        tk.Button(bar, text='依次框 5 个我方名字', command=lambda: self.begin('Alpha')).pack(side='left', padx=4)
-        tk.Label(regions, text='在缩略图上拖出姓名框，只框完整名字；不含头像、段位、倒计时。每侧依次框5个，顺序不限。',
+        ttk.Button(bar, style='BA.TButton', text='读取当前游戏画面', command=self.capture).pack(side='left', padx=4)
+        ttk.Button(bar, style='BA.TButton', text='载入已有截图', command=self.load_image).pack(side='left', padx=4)
+        ttk.Button(bar, style='BA.TButton', text='依次框 5 个对手名字', command=lambda: self.begin('Bravo')).pack(side='left', padx=4)
+        ttk.Button(bar, style='BA.TButton', text='依次框 5 个我方名字', command=lambda: self.begin('Alpha')).pack(side='left', padx=4)
+        ttk.Label(regions, style='BA.TLabel', text='在缩略图上拖出姓名框，只框完整名字；不含头像、段位、倒计时。每侧依次框5个，顺序不限。',
                  wraplength=900, justify='left').pack(anchor='w', pady=5)
-        tk.Label(regions, text='先切回游戏再从悬浮窗读取，移开其他软件窗口。载入的图片须只有完整游戏画面，不带桌面、标题栏或黑边。',
+        ttk.Label(regions, style='Muted.BA.TLabel', text='先切回游戏再从悬浮窗读取，移开其他软件窗口。载入的图片须只有完整游戏画面，不带桌面、标题栏或黑边。',
                  wraplength=900, justify='left').pack(anchor='w', pady=(0, 5))
-        self.canvas = tk.Canvas(regions, width=890, height=440, background='#202532', highlightthickness=0)
+        self.canvas = tk.Canvas(regions, width=890, height=440, background=BG, highlightthickness=0)
         self.canvas.pack(fill='both', expand=True)
         self.canvas.bind('<ButtonPress-1>', self.press)
         self.canvas.bind('<B1-Motion>', self.drag)
@@ -69,8 +77,9 @@ class PrepDialog:
         self.select_team = None
         self.anchor = None
         self.drag_rect = None
-        tk.Button(regions, text='保存识别区域并启用自动读取', command=self.save_regions).pack(pady=8)
-        tk.Button(self.root, text='关闭', command=self.root.destroy).pack(pady=(0, 10))
+        ttk.Button(regions, style='Primary.BA.TButton', text='保存识别区域并启用自动读取',
+                   command=self.save_regions).pack(side='bottom', anchor='e', before=self.canvas, pady=6)
+        ttk.Button(self.root, style='BA.TButton', text='关闭', command=self.root.destroy).pack(anchor='e', padx=14, pady=(0, 10))
         self.update_rows(getattr(owner, 'prep_rows', []))
         if not self.regions:
             tabs.select(regions)
@@ -182,7 +191,7 @@ class PrepDialog:
         if self.select_team is None or self.preview is None:
             return
         self.anchor = (max(0, min(event.x, self.preview.width())), max(0, min(event.y, self.preview.height())))
-        self.drag_rect = self.canvas.create_rectangle(*self.anchor, *self.anchor, outline='#ffe35a', width=2)
+        self.drag_rect = self.canvas.create_rectangle(*self.anchor, *self.anchor, outline=ACCENT, width=2)
 
     def drag(self, event):
         if self.anchor is not None:

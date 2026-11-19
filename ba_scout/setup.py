@@ -11,6 +11,7 @@ import copy
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from .dialog_style import FONT, configure_dialog
 from .roster import recent_roster
 from .settings import ROOT, DEFAULTS, atomic_json, read_path
 
@@ -99,6 +100,7 @@ def _configuration_dialog(config: dict) -> dict | None:
     root = tk.Tk()
     root.title("断箭数据查看器 · 便携版首次配置")
     root.resizable(False, False)
+    configure_dialog(root)
     result = None
     candidates = discover_log_dirs()
     initial_dir = config.get("log_dir") or (candidates[0] if len(candidates) == 1 else "")
@@ -107,11 +109,12 @@ def _configuration_dialog(config: dict) -> dict | None:
     selected = tk.StringVar(value="")
     status = tk.StringVar(value="请确认日志目录，再手填 ID 或读取名单并选择你自己。名单不会自动选择。")
     choices = {}
-    frame = ttk.Frame(root, padding=16)
+    frame = ttk.Frame(root, style="BA.TFrame", padding=(22, 18))
     frame.pack(fill="both", expand=True)
-    ttk.Label(frame, text="第一次使用：选择游戏日志目录与本人身份", font=("Microsoft YaHei UI", 12)).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
-    ttk.Label(frame, text="GameLogs 目录").grid(row=1, column=0, sticky="w", padx=(0, 10))
-    path_box = ttk.Combobox(frame, textvariable=directory, values=candidates, width=62)
+    ttk.Label(frame, style="Title.BA.TLabel", text="第一次使用：选择游戏日志目录与本人身份").grid(
+        row=0, column=0, columnspan=3, sticky="w", pady=(0, 18))
+    ttk.Label(frame, text="GameLogs 目录", style="BA.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 12))
+    path_box = ttk.Combobox(frame, textvariable=directory, values=candidates, width=46, font=FONT, style="BA.TCombobox")
     path_box.grid(row=1, column=1, sticky="ew")
 
     def browse():
@@ -122,11 +125,11 @@ def _configuration_dialog(config: dict) -> dict | None:
             roster_box.configure(values=[])
             choices.clear()
 
-    ttk.Button(frame, text="浏览…", command=browse).grid(row=1, column=2, padx=(10, 0))
-    ttk.Label(frame, text="自己的数字玩家 ID").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=12)
-    ttk.Entry(frame, textvariable=identity, width=28).grid(row=2, column=1, sticky="w")
-    ttk.Label(frame, text="最近名单（请明确选自己）").grid(row=3, column=0, sticky="w", padx=(0, 10))
-    roster_box = ttk.Combobox(frame, textvariable=selected, state="readonly", width=62)
+    ttk.Button(frame, text="浏览…", command=browse, style="BA.TButton").grid(row=1, column=2, padx=(10, 0), sticky="ew")
+    ttk.Label(frame, text="自己的数字玩家 ID", style="BA.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=12)
+    ttk.Entry(frame, textvariable=identity, width=22, font=FONT, style="BA.TEntry").grid(row=2, column=1, sticky="w")
+    ttk.Label(frame, text="最近名单（请明确选自己）", style="BA.TLabel").grid(row=3, column=0, sticky="w", padx=(0, 12))
+    roster_box = ttk.Combobox(frame, textvariable=selected, state="readonly", width=46, font=FONT, style="BA.TCombobox")
     roster_box.grid(row=3, column=1, sticky="ew")
 
     def read_roster():
@@ -147,9 +150,10 @@ def _configuration_dialog(config: dict) -> dict | None:
             status.set("已按你选择的名单条目填写 ID。请核对后点击“保存并启动”。")
 
     roster_box.bind("<<ComboboxSelected>>", select_identity)
-    ttk.Button(frame, text="读取最近名单", command=read_roster).grid(row=3, column=2, padx=(10, 0))
-    ttk.Label(frame, textvariable=status, wraplength=720, foreground="#555555").grid(row=4, column=0, columnspan=3, sticky="w", pady=14)
-    ttk.Label(frame, text="软件读取游戏日志与准备界面姓名；配置、缓存、截图与 TXT 均保存在软件文件夹内。", wraplength=720).grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 14))
+    ttk.Button(frame, text="读取最近名单", command=read_roster, style="BA.TButton").grid(row=3, column=2, padx=(10, 0), sticky="ew")
+    ttk.Label(frame, textvariable=status, wraplength=720, style="BA.TLabel").grid(row=4, column=0, columnspan=3, sticky="w", pady=(16, 6))
+    ttk.Label(frame, text="软件读取游戏日志与准备界面姓名；配置、缓存、截图与 TXT 均保存在软件文件夹内。", wraplength=720,
+              style="Muted.BA.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 16))
 
     def save():
         nonlocal result
@@ -162,10 +166,10 @@ def _configuration_dialog(config: dict) -> dict | None:
         result = candidate
         root.destroy()
 
-    buttons = ttk.Frame(frame)
+    buttons = ttk.Frame(frame, style="BA.TFrame")
     buttons.grid(row=6, column=0, columnspan=3, sticky="e")
-    ttk.Button(buttons, text="退出", command=root.destroy).pack(side="left", padx=6)
-    ttk.Button(buttons, text="保存并启动", command=save).pack(side="left")
+    ttk.Button(buttons, text="退出", command=root.destroy, style="BA.TButton").pack(side="left", padx=6)
+    ttk.Button(buttons, text="保存并启动", command=save, style="Primary.BA.TButton").pack(side="left")
     root.protocol("WM_DELETE_WINDOW", root.destroy)
     root.mainloop()
     return result

@@ -20,6 +20,7 @@ def populated_window():
     window.catalog = None
     window.catalog_note = ""
     window.enemy_button = Mock()
+    window.view_mode = "data"
     window.ally_button = Mock()
     window.window20_button = Mock()
     window.window_primary_button = Mock()

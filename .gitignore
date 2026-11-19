@@ -13,6 +13,7 @@
 !/data/prep-layout-default.json
 *.log
 *.png
+!/docs/overlay-preview.png
 *.jpg
 *.jpeg
 *.lnk
