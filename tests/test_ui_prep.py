@@ -85,7 +85,7 @@ class PreparationUiTests(unittest.TestCase):
         self.assertEqual(rendered, ["准备对手30", "准备对手31", "准备对手32", "对手 4", "对手 5"])
         self.assertEqual([entry.kwargs["values"][-1] for entry in window.table.insert.call_args_list[-2:]],
                          ["重名待确认", "等名字"])
-        window.show_view.assert_called_with("data")
+        window.show_view.assert_called_with("cards")
         self.assertIn("3/5", window.status.set.call_args.args[0])
 
     def test_name_lookup_time_is_deducted_from_both_network_budgets(self):

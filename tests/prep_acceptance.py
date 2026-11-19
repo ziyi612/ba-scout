@@ -177,15 +177,15 @@ def run():
         log.write_text('[2026-01-01 12:00:00.000]\nLog: [NET_ROOM] WaitingRoom entered, fight id: 810099\n\n', 'utf-8')
         def watch():
             now = elapsed()
-            if window.table.winfo_ismapped() and window.live_phase == 'waiting':
-                rows = [list(window.table.item(iid, 'values')) for iid in window.table.get_children()]
+            if window.cards.winfo_ismapped() and not window.table.winfo_ismapped() and window.live_phase == 'waiting':
+                rows = window.cards.visible_rows()
                 if not snapshots or rows != snapshots[-1][1]:
                     snapshots.append([now, rows])
                 for row in rows:
-                    if row[0] in PLAYERS:
-                        first_text.setdefault(row[0], now)
-                        if '50%' in row[2] or '50.0%' in row[2]:
-                            first_stats.setdefault(row[0], now)
+                    if row['name'] in PLAYERS:
+                        first_text.setdefault(row['name'], now)
+                        if '50%' in row['performance'] or '50.0%' in row['performance']:
+                            first_stats.setdefault(row['name'], now)
             ready = len(first_stats) == 5 and all(
                 window.opening_states.get(pid, {}).get('data', {}).get('sample_count') and
                 window.opening20_states.get(pid, {}).get('data', {}).get('sample_count') for pid in PLAYERS.values())
@@ -203,16 +203,16 @@ def run():
             'only_preparation': window.live_phase == 'waiting' and window.current_roster is not None
                                 and window.current_roster.source == 'screen_names',
             'five_visible_slots': bool(snapshots) and all(len(rows) == 5 for _, rows in snapshots),
-            'one_at_a_time': sorted(set(sum(r[0] in PLAYERS for r in rows) for _, rows in snapshots)) == list(range(6)),
+            'one_at_a_time': sorted(set(sum(r['name'] in PLAYERS for r in rows) for _, rows in snapshots)) == list(range(6)),
             'first_stats_before_fifth_name': first_stats.get('Raven', 100) < ARRIVALS[-1],
             'independent_while_timed_out': first_stats.get('Cobra', 100) < first_stats.get(DELAYED, 0),
             'deadline_then_recovery': 'timeout' in [s for _, s in row_states]
                                       and requests[DELAYED] == 2 and DELAYED in first_stats,
-            'recovery_visible': any(len(rows) == 5 and rows[1][-1] == '补查中' for _, rows in snapshots),
-            'correct_slots_ids_and_values': bool(snapshots) and list(window.table.get_children()) ==
-                [str(PLAYERS[name]) for name in NAMES] and [r[0] for r in snapshots[-1][1]] == list(NAMES)
+            'recovery_visible': any(len(rows) == 5 and rows[1]['status'] == '补查中' for _, rows in snapshots),
+            'correct_slots_ids_and_values': bool(snapshots) and [r['iid'] for r in snapshots[-1][1]] ==
+                [str(PLAYERS[name]) for name in NAMES] and [r['name'] for r in snapshots[-1][1]] == list(NAMES)
                 and set(first_stats) == set(NAMES),
-            'no_disappearance': all({r[0] for r in prev if r[0] in PLAYERS}.issubset({r[0] for r in nxt})
+            'no_disappearance': all({r['name'] for r in prev if r['name'] in PLAYERS}.issubset({r['name'] for r in nxt})
                                     for (_, prev), (_, nxt) in zip(snapshots, snapshots[1:])),
             'both_opening_windows': all(window.opening_states.get(pid, {}).get('data', {}).get('sample_count') == 1
                                         and window.opening20_states.get(pid, {}).get('data', {}).get('sample_count') == 1
@@ -221,7 +221,7 @@ def run():
         }
         report = dict(passed=all(checks.values()), checks=checks, first_name_seconds=first_text,
                       first_stats_seconds=first_stats, delayed_slot=row_states, frames=frames, requests=protocol,
-                      visible_table=snapshots, errors=errors, data_source='Synthetic loopback HTTP; native OCR and Tk')
+                      visible_cards=snapshots, errors=errors, data_source='Synthetic loopback HTTP; native OCR and Tk')
         path = directory / 'result.json'
         path.write_text(json.dumps(report, ensure_ascii=False, indent=2), 'utf-8')
         print(json.dumps({**{k: report[k] for k in ('passed','checks','first_stats_seconds','delayed_slot')},

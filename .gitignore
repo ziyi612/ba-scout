@@ -14,6 +14,7 @@
 *.log
 *.png
 !/docs/overlay-preview.png
+!/docs/overlay-expanded.png
 *.jpg
 *.jpeg
 *.lnk

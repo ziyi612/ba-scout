@@ -34,6 +34,7 @@ def populated_window():
     window.live_phase = "game_room"
     window.live_fight_id = "980021"
     window.selected_id = 20
+    window.card_detail_id = "20"
     window.is_replay = True
     window.core_elapsed = 3.0
     window.stale_history_ids = {20}
@@ -74,6 +75,12 @@ class UiLifecycleTests(unittest.TestCase):
         self.assertFalse(window.is_replay)
         window.report_button.config.assert_called_with(state="disabled")
         window.table.delete.assert_called_with("old-player")
+        self.assertIsNone(window.card_detail_id)
+        cards = window.cards.set_rows.call_args.args[0]
+        if phase == "waiting":
+            self.assertEqual([iid for iid, _, _ in cards], [f"slot-{i}" for i in range(5)])
+        else:
+            self.assertEqual(cards, [])
         if phase == "waiting":
             self.assertEqual([row.kwargs["iid"] for row in window.table.insert.call_args_list],
                              [f"slot-{index}" for index in range(5)])

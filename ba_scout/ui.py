@@ -16,6 +16,7 @@ from tkinter import font as tkfont
 
 from .dialog_style import FONT as DIALOG_FONT, configure_dialog, fill_reader, reader
 from .engine import ScanController
+from .player_cards import PlayerCards
 from .labels import short_combo, combo_country
 from .metrics import profile_metrics, tied_top_count
 from .provider import fetch_player, profile_history
@@ -110,7 +111,7 @@ def unit_label(unit, compact=False):
 
 
 def style_observation_buttons(window):
-    whole_match = window.view_mode == "data" and window.analysis_mode == "recent"
+    whole_match = window.view_mode != "summary" and window.analysis_mode == "recent"
     for button, active in ((window.window20_button, not whole_match and window.opening_view_seconds == 20),
                            (window.window_primary_button, not whole_match and window.opening_view_seconds != 20),
                            (window.analysis_button, whole_match)):
@@ -148,7 +149,8 @@ class ScoutWindow:
         self.opening_view_seconds = 20
         self.stale_history_ids = set()
         self.analysis_mode = "opening"
-        self.view_mode = "data"
+        self.view_mode = "cards"
+        self.card_detail_id = None
         self.summary = {}
         self.summary20 = {}
         self.catalog, self.catalog_note = self.load_tactical_catalog()
@@ -278,6 +280,23 @@ class ScoutWindow:
 
         self.content = tk.Frame(self.body, bg=BG)
         self.content.pack(fill="both", expand=True)
+        self.cards_panel = tk.Frame(self.content, bg=BG)
+        self.cards_panel.grid_columnconfigure(0, weight=1)
+        self.cards_panel.grid_rowconfigure(0, weight=1)
+        self.card_viewport = tk.Canvas(self.cards_panel, bg=BG, bd=0, highlightthickness=0,
+                                       yscrollincrement=1, takefocus=False)
+        self.card_viewport.grid(row=0, column=0, sticky="nsew")
+        # The scrollbar lives in the outer margin. Showing it must not change the
+        # card width, otherwise a wrapped drawer can oscillate between two heights.
+        self.card_scroll = ttk.Scrollbar(self.outer, orient="vertical", style="Scout.Vertical.TScrollbar",
+                                         command=self.card_viewport.yview)
+        self.card_viewport.configure(yscrollcommand=self.card_scroll.set)
+        self.cards = PlayerCards(self.card_viewport, self.activate_card, self.open_card_details)
+        self.card_detail_panel = self.cards.detail_panel
+        self.card_item = self.card_viewport.create_window(0, 0, anchor="nw", window=self.cards)
+        self.card_viewport.bind("<Configure>", self.layout_cards)
+        self.cards.bind("<Configure>", self.layout_cards)
+        self.root.bind("<MouseWheel>", self.scroll_cards, add="+")
         self.data_panel = tk.Frame(self.content, bg=BG)
         self.summary_panel = tk.Frame(self.content, bg=BG)
         self.summary_heading = tk.StringVar(value="对手开局数据汇总")
@@ -341,7 +360,7 @@ class ScoutWindow:
                                          activeforeground=FG, relief="flat", bd=0, cursor="hand2", takefocus=True,
                                          padx=10, pady=4, font=(FONT, -13))
         menu = tk.Menu(self.more_button, tearoff=False)
-        for label, command in (("刷新本场", self.refresh), ("测试上局", self.replay_latest),
+        for label, command in (("数据表", self.show_table), ("刷新本场", self.refresh), ("测试上局", self.replay_latest),
                                ("复制所选来源", self.copy_source), ("复制数据汇总", self.copy_summary),
                                ("设置", self.settings_dialog)):
             menu.add_command(label=label, command=command)
@@ -353,7 +372,7 @@ class ScoutWindow:
                                font=(FONT, -12), anchor="w", padx=14, pady=4)
         self.footer.pack(side="bottom", fill="x", before=self.body)
         self.select_team("enemy")
-        self.show_view("data")
+        self.show_view("cards")
         self.update_summary()
 
     def load_tactical_catalog(self):
@@ -375,24 +394,32 @@ class ScoutWindow:
             return None, "单位分类库未取得；仅显示原始单位记录。"
 
     def show_view(self, mode):
+        if mode != "cards":
+            self.card_detail_id = None
+            self.cards.show_detail(None)
         self.view_mode = mode
-        self.data_panel.pack_forget()
-        self.summary_panel.pack_forget()
-        panel = self.summary_panel if mode == "summary" else self.data_panel
+        panels = {"cards": self.cards_panel, "data": self.data_panel, "summary": self.summary_panel}
+        for widget in panels.values():
+            widget.pack_forget()
+        panel = panels[mode]
         panel.pack(fill="both", expand=True)
         style_observation_buttons(self)
         self.summary_button.config(bg=SELECTED if mode == "summary" else SURFACE,
                                    fg=ACCENT if mode == "summary" else MUTED)
         for team, button in (("enemy", self.enemy_button), ("ally", self.ally_button)):
-            selected = mode == "data" and team == self.team_mode
+            selected = mode != "summary" and team == self.team_mode
             button.config(bg=SELECTED if selected else SURFACE, fg=ACCENT if selected else MUTED)
 
-    def show_players(self, team):
+    def show_table(self):
         self.show_view("data")
+
+    def show_players(self, team):
+        self.show_view("cards")
         self.select_team(team)
 
     def show_other_analysis(self):
-        self.show_view("data")
+        if self.view_mode == "summary":
+            self.show_view("cards")
         self.toggle_analysis()
 
     def update_summary(self):
@@ -509,9 +536,11 @@ class ScoutWindow:
         self.root.update_idletasks()
 
     def select_team(self, mode):
+        if self.team_mode != mode:
+            self.card_detail_id = None
         self.team_mode = mode
         for team, button in (("enemy", self.enemy_button), ("ally", self.ally_button)):
-            selected = team == mode and self.view_mode == "data"
+            selected = team == mode and self.view_mode != "summary"
             button.config(bg=SELECTED if selected else SURFACE, fg=ACCENT if selected else MUTED)
         self.render_rows()
 
@@ -542,7 +571,7 @@ class ScoutWindow:
         self.table.heading("recent", text="最近1场出场" if self.analysis_mode == "recent" else "开局记录 · " + self.opening_window_label())
         self.render_rows()
 
-    def opening_row(self, player_id):
+    def opening_row(self, player_id, *, full_names=False):
         if player_id not in self.enemy_ids:
             return "优先分析对手"
         state = self.selected_opening_states().get(player_id, {})
@@ -555,6 +584,8 @@ class ScoutWindow:
         units = data.get("units") or []
         if not units:
             return label + "\n窗口内无出场记录"
+        if full_names:
+            return "\n".join(f"{unit_label(unit)} {unit['matches_with_unit']}/{count}局" for unit in units[:2])
         fragments = []
         budget = int(self.table.column("recent", "width")) - 12
         for unit in units[:2]:
@@ -606,7 +637,7 @@ class ScoutWindow:
         return lines
 
     def render_rows(self):
-        previous = str(self.selected_id) if self.selected_id else None
+        previous = self.card_detail_id or (str(self.selected_id) if self.selected_id else None)
         existing = set(self.table.get_children())
         own = next((p["team"] for p in self.players if p["id"] == self.config["self_id"]),
                    getattr(self.current_roster, 'self_team', None))
@@ -674,7 +705,19 @@ class ScoutWindow:
             label = "*旧缓存" if cached else labels.get(status, status)
             rating = number(fields["rating"]) + ("*" if "rating" in cached else "")
             items.append((str(player["id"]), (name, rating, performance, spec, recent_text, label), tag))
+        card_rows = []
+        for iid, values, tag in items:
+            if self.analysis_mode == "opening" and not iid.startswith("slot-"):
+                values = (*values[:4], self.opening_row(int(iid), full_names=True), values[5])
+            card_rows.append((iid, values, tag))
+        self.cards.set_opening_label("最近整场" if self.analysis_mode == "recent" else
+                                     self.opening_window_label() + "出兵")
+        self.cards.set_rows(card_rows)
+        empty = "该阵营暂无已确认的玩家" if self.players else "等待本场名单"
+        self.cards.show_empty("" if items else empty)
         desired = {iid for iid, _, _ in items}
+        if self.card_detail_id not in desired:
+            self.card_detail_id = None
         for iid in existing - desired:
             self.table.delete(iid)
         for index, (iid, values, tag) in enumerate(items):
@@ -687,13 +730,98 @@ class ScoutWindow:
                 self.table.insert("", index, iid=iid, values=values, tags=tags)
         if isinstance(self.table, RosterTable):
             self.table.schedule_paint()
-            empty = "该阵营暂无已确认的玩家" if self.players else "等待本场名单"
             self.table.show_empty("" if items else empty)
         if previous in desired:
             self.table.selection_set(previous)
         elif selected:
             self.table.selection_set(str(selected[0]["id"]))
         self.on_select()
+        self.sync_card_detail()
+
+    def layout_cards(self, event):
+        canvas = self.card_viewport
+        if event.widget is canvas:
+            canvas.itemconfigure(self.card_item, width=max(1, event.width))
+        height = self.cards.winfo_reqheight()
+        canvas.configure(scrollregion=(0, 0, max(1, canvas.winfo_width()), height))
+        if height > canvas.winfo_height():
+            if not self.card_scroll.winfo_manager():
+                self.card_scroll.place(in_=canvas, relx=1, x=1, y=0, relheight=1, width=11)
+        elif self.card_scroll.winfo_manager():
+            self.card_scroll.place_forget()
+            canvas.yview_moveto(0)
+
+    def scroll_cards(self, event):
+        canvas = self.card_viewport
+        if (self.view_mode == "cards" and canvas.winfo_ismapped() and
+                0 <= event.x_root - canvas.winfo_rootx() < canvas.winfo_width() and
+                0 <= event.y_root - canvas.winfo_rooty() < canvas.winfo_height()):
+            canvas.yview_scroll(-round(event.delta / 120 * 36), "units")
+            return "break"
+
+    def activate_card(self, iid):
+        if iid not in self.cards.cards:
+            return
+        self.table.selection_set(iid)
+        self.on_select()
+        self.card_detail_id = None if iid == self.card_detail_id else iid
+        self.sync_card_detail()
+        if self.card_detail_id:
+            self.root.after_idle(self.reveal_card_detail)
+
+    def reveal_card_detail(self):
+        if not self.card_detail_id or not self.card_detail_panel.winfo_ismapped():
+            return
+        panel, canvas = self.card_detail_panel, self.card_viewport
+        bottom = panel.winfo_y() + panel.winfo_height()
+        if bottom > canvas.canvasy(canvas.winfo_height()):
+            canvas.yview_moveto(max(0, bottom - canvas.winfo_height()) / max(1, self.cards.winfo_height()))
+
+    def open_card_details(self, iid):
+        if iid in self.cards.cards and not iid.startswith("slot-"):
+            self.table.selection_set(iid)
+            self.on_select()
+            return self.player_details()
+
+    def sync_card_detail(self):
+        iid = self.card_detail_id
+        self.cards.set_selected(iid)
+        if iid is None:
+            self.cards.show_detail(None)
+            return
+        if iid.startswith("slot-"):
+            self.cards.show_detail(iid, self.detail_title.get(), self.detail_text.get())
+            return
+        pid = int(iid)
+        if self.analysis_mode == "opening" and pid in self.enemy_ids:
+            state = self.selected_opening_states().get(pid, {})
+            sample = state.get("data") or {}
+            count = sample.get("sample_count", 0)
+            requested = sample.get("requested_count", self.config.get("opening_history_limit", 5))
+            title = f"{self.detail_title.get()} · 开局{self.opening_window_label()} · 有效样本 {count}/{requested} 局"
+            units = sample.get("units") or []
+            body = "　".join(f"{unit_label(u)} {u['matches_with_unit']}/{count}局" for u in units[:3])
+            if not body:
+                body = "该时间窗内无出场记录" if count else state.get("message") or "等待开局样本"
+        else:
+            title = self.detail_title.get()
+            state = self.recon_states.get(pid, {})
+            sample = state.get("data") or {}
+            units = sample.get("air_units") or sample.get("top_units") or []
+            body = "　".join(f"{unit_label(u)} ×{u['count']}" for u in units[:3])
+            if not body:
+                body = state.get("message") or self.detail_text.get().split("\n")[0]
+        stats = self.states.get(pid, {})
+        fields, cached = overview_fields(stats, pid)
+        detail = []
+        if fields["value_exchange"] is not None:
+            detail.append("交换比 " + number(fields["value_exchange"], 2) + ("*" if "value_exchange" in cached else ""))
+        games = (stats.get("data") or {}).get("ranked_games")
+        if games is not None:
+            detail.append(f"排位 {number(games)} 场")
+        if detail:
+            title += " · " + " · ".join(detail)
+        self.cards.show_detail(iid, title, body)
 
     def on_select(self, event=None):
         selection = self.table.selection()
@@ -920,6 +1048,7 @@ class ScoutWindow:
         self.opening_states = {}
         self.opening20_states = {}
         if new_match:
+            self.card_detail_id = None
             self.opening_view_seconds = 20
             self.analysis_mode = "opening"
             self.analysis_button.config(text="看整场出场")
@@ -967,7 +1096,7 @@ class ScoutWindow:
         self.compact.set(f"{prefix}  0/{len(roster.players)}")
         self.detail_title.set("正在查询公开战绩")
         self.detail_text.set("专精组合按历史经验排序；不会据此推断本场卡组。")
-        self.show_view("data")
+        self.show_view("cards")
         self.update_summary()
         if getattr(roster, 'source', '') in {'screen_names', 'manual_names'}:
             self.status.set(f'准备阶段 · 已匹配 {len(self.enemy_ids)}/5 名对手 · 姓名来源，等待游戏 ID 名单核对')
@@ -1048,6 +1177,7 @@ class ScoutWindow:
         self.current_roster = None
         self.players = []
         self.enemy_ids = []
+        self.card_detail_id = None
         self.selected_id = None
         self.states = {}
         self.recon_states = {}
@@ -1125,7 +1255,7 @@ class ScoutWindow:
         self.opening_view_seconds = 20
         self.analysis_button.config(text="看整场出场")
         self.table.heading("recent", text="开局记录 · 前20秒")
-        self.show_view("data")
+        self.show_view("cards")
         self.select_team("enemy")
         if not self.config.get('prep_regions'):
             self.show_prep_state('已进入准备阶段 · 请点“准备识别”设置双方姓名位置；也可输入名字立即查询',
@@ -1682,7 +1812,8 @@ class ScoutWindow:
         self._test_check("report_actions_fit_window", all(
             child.winfo_ismapped() and child.winfo_width() >= child.winfo_reqwidth()
             for child in self.report_button.master.winfo_children()))
-        self._test_check("enemy_table_is_default_view", self.view_mode == "data" and self.data_panel.winfo_ismapped())
+        self._test_check("opponent_cards_are_default", self.view_mode == "cards"
+                         and self.cards.winfo_ismapped() and not self.table.winfo_ismapped())
         self.summary_button.invoke()
         self.root.update_idletasks()
         self._test_check("summary_view_available", self.summary_panel.winfo_ismapped())
@@ -1708,6 +1839,42 @@ class ScoutWindow:
         self._test_check("full_data_summary_openable", summary_dialog.winfo_ismapped())
         summary_dialog.destroy()
         self.show_players("enemy")
+        # Let the window manager remap the Canvas after leaving the summary.
+        self.root.after(80, self.self_test_cards)
+
+    def self_test_cards(self):
+        visible_cards = self.cards.visible_rows()
+        self._test_check("five_drawn_enemy_cards", [row["iid"] for row in visible_cards] ==
+                         [str(pid) for pid in self.enemy_ids] and len(visible_cards) == 5)
+        card_widgets = [self.cards.cards[row["iid"]] for row in visible_cards]
+        card_bottoms = [c.winfo_rooty() + c.winfo_height() for c in card_widgets]
+        self._test_check("five_cards_fit_overlay", len(card_widgets) == 5 and all(
+            c.winfo_ismapped() and c.winfo_width() > c.winfo_height() > 1
+            for c in card_widgets) and all(
+            bottom <= following.winfo_rooty() for bottom, following in zip(card_bottoms, card_widgets[1:]))
+            and card_bottoms[-1] <= self.root.winfo_rooty() + self.root.winfo_height())
+        self._test_check("card_stats_and_samples_rendered", bool(visible_cards) and all(
+            row["rating"] != "—" and "%" in row["performance"] and "空降+骑兵" in row["spec"]
+            and "2/2" in row["recent"] for row in visible_cards))
+        if visible_cards:
+            first_id = visible_cards[0]["iid"]
+            card = self.cards.cards[first_id]
+            card.event_generate("<ButtonPress-1>", x=8, y=8, time=1000)
+            card.event_generate("<ButtonRelease-1>", x=8, y=8, time=1050)
+            self.root.update_idletasks()
+            self._test_check("card_click_expands_this_player", str(self.card_detail_id) == first_id
+                             and self.card_detail_panel.winfo_ismapped())
+            self._test_check("detail_drawer_under_chosen_card", self.cards.detail_title.winfo_ismapped()
+                             and bool(self.cards.detail_title.cget("text")) and bool(self.cards.detail_body.cget("text"))
+                             and card.winfo_rooty() + card.winfo_height() <= self.card_detail_panel.winfo_rooty()
+                             and (len(card_widgets) < 2 or self.card_detail_panel.winfo_rooty() +
+                                  self.card_detail_panel.winfo_height() <= card_widgets[1].winfo_rooty()))
+            card.event_generate("<ButtonPress-1>", x=8, y=8, time=4000)
+            card.event_generate("<ButtonRelease-1>", x=8, y=8, time=4050)
+            self.root.update_idletasks()
+            self._test_check("second_card_click_collapses", self.card_detail_id is None
+                             and not self.card_detail_panel.winfo_ismapped())
+        self.show_table()
         self.root.update_idletasks()
         self._test_check("player_data_view_preserved", self.data_panel.winfo_ismapped())
         self._test_check("ten_results_rendered", len(self.states) == 10 and not self.scanning)
