@@ -48,6 +48,16 @@ class PlayerCardsTests(unittest.TestCase):
                                   rooty=widget.winfo_rooty()+3, time=timestamp)
             self.root.update()
 
+    def test_pending_full_nickname_uses_empty_middle_column_without_covering_status(self):
+        name = "在漫长的海岸寻找归航灯光的远方来客"
+        self.board.set_rows([("slot-0", (name, "—", "已读昵称 · 账号待核对", "—", "—", "查身份中"), "pending")])
+        self.root.update()
+        card = self.board.cards["slot-0"]
+        self.assertGreater(self.board.name_font.measure(name), card.winfo_width() * .35 - 25)
+        self.assertEqual(self.board.visible_rows()[0]["name"], name)
+        self.assertLessEqual(card.name.winfo_rootx() + card.name.winfo_width(), card.status.winfo_rootx())
+        self.assertTrue(card.pending_note.winfo_ismapped())
+
     def test_encounter_mark_shares_the_name_line_and_is_cleared_on_change(self):
         self.board.set_rows([player(12, "A very long name repeated twice for the layout check")])
         self.board.set_encounters({"12": "曾为对手 · 曾为队友"})

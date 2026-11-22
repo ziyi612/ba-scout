@@ -53,7 +53,7 @@ def old_dialog():
             self.value = value
 
     keys = [(team, index) for team in ("Alpha", "Bravo") for index in range(5)]
-    dialog = SimpleNamespace(entries={key: Value("上局旧姓名") for key in keys},
+    dialog = SimpleNamespace(suggested_names={}, entries={key: Value("上局旧姓名") for key in keys},
                              selectors={key: Value("上局旧姓名 · ID 88") for key in keys},
                              candidates={key: {"上局旧姓名 · ID 88": {"name": "上局旧姓名", "id": 88}} for key in keys},
                              note=Mock(), owner=SimpleNamespace(start_prep_manual=Mock()), exists=lambda: True)
@@ -189,13 +189,20 @@ class PreparationUiTests(unittest.TestCase):
         for source in ("screen", "manual"):
             with self.subTest(source=source):
                 window = prep_window()
-                self.resolve(window, source=source)
+                event = resolved_event(source=source)
+                ambiguous = next(row for row in event["rows"] if row["index"] == 3)
+                ambiguous["stable_name"] = "Север"
+                window.prep_controller.poll_events = queue_poll([event])
+                window.poll_prep()
+                cards = window.cards.set_rows.call_args.args[0]
+                self.assertEqual(cards[3][0], "slot-3")
+                self.assertEqual(cards[3][1][:3], ("Север", "—", "已读昵称 · 账号待核对"))
                 text = build_scout_report(window.current_roster, {}, {}, {}, window.enemy_ids,
                                           is_replay=False, data_summary=window.summary,
                                           opening20_states={}, data_summary20=window.summary20)
                 self.assertIn("待游戏", text)
                 self.assertIn("尚未由游戏数字 ID 名单校核", text)
-                self.assertIn("同名两人待选择", text)
+                self.assertIn("已读昵称 Север · 同名两人待选择", text)
                 self.assertIn("第五行未识别", text)
                 self.assertIn("未匹配的人未计入统计", text)
                 self.assertIn("对手 · 3 人", text)
@@ -217,6 +224,23 @@ class PreparationUiTests(unittest.TestCase):
         window.prep_controller.cancel.assert_called_once_with()
         window.prep_controller.start.assert_called_once_with("980021", {}, manual_rows=rows)
         self.assertEqual(window.prep_generation, 42)
+
+    def test_correction_uses_verified_spelling_and_survives_another_rows_update(self):
+        dialog = old_dialog()
+        key = ("Bravo", 0)
+        row = {"team": "Bravo", "index": 0, "name": "Fi", "corroborated_name": "Filo",
+               "variants": ["Fi", "Filo"]}
+        dialog.update_rows([row])
+        self.assertEqual(dialog.entries[key].get(), "Filo")
+        dialog.entries[key].set("Fil0")
+        dialog.entries["Bravo", 4].set("尚未出现的昵称")
+        dialog.update_rows([row, {"team": "Bravo", "index": 1, "name": "Juniper"}])
+        self.assertEqual(dialog.entries[key].get(), "Fil0")
+        self.assertEqual(dialog.entries["Bravo", 1].get(), "Juniper")
+        self.assertEqual(dialog.entries["Bravo", 4].get(), "尚未出现的昵称")
+        dialog.update_rows([])
+        self.assertEqual(dialog.entries["Bravo", 4].get(), "")
+        self.assertEqual(dialog.entries[key].get(), "")
 
     def test_manual_dialog_only_forwards_explicitly_selected_same_name_id(self):
         for selected in ("", "同名 · ID 77"):

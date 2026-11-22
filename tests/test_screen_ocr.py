@@ -104,6 +104,45 @@ try {
         self.assertEqual(json.loads(result.stdout.strip().splitlines()[-1]),
                          {"game": True, "child": True, "overlay": True, "other": False, "noFocus": False})
 
+    def test_secondary_name_view_preserves_dim_strokes_and_marks_crop_edges(self):
+        env = dict(os.environ, TEMP=self.directory.name, TMP=self.directory.name,
+                   BA_NAME_CS=str(SCRATCH.parents[1] / "ba_scout" / "name_ocr.cs"))
+        command = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+Add-Type -Path $env:BA_NAME_CS -ReferencedAssemblies System.Drawing
+$image = [Drawing.Bitmap]::new(28,14)
+try {
+    for ($y=4; $y -le 9; $y++) {
+        for ($x=4; $x -le 9; $x++) {
+            $image.SetPixel($x,$y,[Drawing.Color]::FromArgb(200,120,35))
+        }
+    }
+    $image.SetPixel(15,7,[Drawing.Color]::White)
+    $box = [double[]]@(0,0,1,1)
+    $base = [BAScoutOCR.NameRecognizer]::Prepare($image,$box,$false)
+    $soft = [BAScoutOCR.NameRecognizer]::Prepare($image,$box,$true)
+    # The white anchor ends the 18px crop. The secondary view adds 3px on each side.
+    $baseSample = 24*$base.width + [int]($base.width*6.5/18)
+    $softSample = 24*$soft.width + [int]($soft.width*9.5/24)
+    $image.SetPixel(27,7,[Drawing.Color]::White)
+    $touching = [BAScoutOCR.NameRecognizer]::Prepare($image,$box,$true)
+    [ordered]@{
+        dimStroke = ($base.pixels[$baseSample] -eq -1 -and $soft.pixels[$softSample] -gt -0.7)
+        blackBorders = ($soft.pixels[24*$soft.width] -eq -1 -and $soft.pixels[25*$soft.width-1] -eq -1)
+        cropFlags = (!$base.clipped -and !$soft.clipped -and $touching.clipped)
+    } | ConvertTo-Json -Compress
+} finally {
+    $image.Dispose()
+}
+"""
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace", timeout=20,
+            env=env, creationflags=subprocess.CREATE_NO_WINDOW)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(json.loads(result.stdout), {"dimStroke": True, "blackBorders": True, "cropFlags": True})
+
     def test_packaged_recognizer_and_primary_fallback_on_identical_pixels(self):
         import shutil
         from tests.prep_acceptance import make_frames, NAMES
@@ -120,6 +159,7 @@ try {
             self.assertEqual([r["index"] for r in readings], list(range(5)))
             self.assertEqual([r["text"] for r in readings], list(NAMES))
             self.assertTrue(all(r["confidence"] > .9 and not r["clipped"] for r in readings))
+            self.assertTrue(all("alternate_text" not in r for r in readings if r["confidence"] > .96))
             worker = client.worker_script
         # An unavailable secondary model must not take down Windows OCR.
         for name in ("ocr_worker.ps1", "name_ocr.ps1", "name_ocr.cs"):

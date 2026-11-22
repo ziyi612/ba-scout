@@ -81,6 +81,10 @@ class _Round:
     capture_started: float | None = None
     rows: list = field(default_factory=list)
     previous: dict = field(default_factory=dict)
+    previous_native: dict = field(default_factory=dict)
+    previous_visual: dict = field(default_factory=dict)
+    previous_disputed: set = field(default_factory=set)
+    confirmed_spellings: dict = field(default_factory=dict)
     results: dict = field(default_factory=dict)
     pending: set = field(default_factory=set)
     name_requests: int = 0
@@ -160,7 +164,7 @@ def _prepare_rows(raw_rows, manual=False):
                         value = variant
                     names.append(normalize_name(value))
                 row["variants"] = list(dict.fromkeys(names))
-                for field in ("corroborated_name", "independent_name"):
+                for field in ("corroborated_name", "independent_name", "native_supported_name", "visual_name", "contradicted_name"):
                     if not manual and isinstance(raw.get(field), str):
                         verified = normalize_name(raw[field])
                         if verified in names:
@@ -168,6 +172,10 @@ def _prepare_rows(raw_rows, manual=False):
                 if row.get("corroborated_name"):
                     row["variants"] = [row["corroborated_name"]]
                 row["queryable"] = bool(names) and (manual or raw.get("queryable") is True)
+                if raw.get("auxiliary_alternatives") and not manual:
+                    row["observed_variants"] = list(dict.fromkeys(row["observed_variants"] + raw["auxiliary_alternatives"]))
+                if not manual and (raw.get("auxiliary_conflict") or raw.get("competing_scripts")):
+                    row["disputed_spelling"] = True
                 if raw.get("valid") is False and not manual:
                     row["queryable"] = False
             except ValueError as exc:
@@ -406,6 +414,9 @@ class PrepController:
                         return
                     if extracted.get("geometry_valid") is not True:
                         scan.previous = {}
+                        scan.previous_native = {}
+                        scan.previous_visual = {}
+                        scan.previous_disputed.clear()
                         scan.first_seen = {}
                         self._status(scan, "waiting", "昵称区域校准无效，暂不查询身份。", capture_status="invalid_geometry")
                     else:
@@ -419,12 +430,35 @@ class PrepController:
                         # two-frame observation. Placeholders reset stability,
                         # but never discard already validated identities.
                         first_seen = {}
+                        current_native = {}
+                        current_visual = {}
+                        disputed = set()
                         for row in rows:
                             key = row["team"], row["index"]
                             if key not in current:
                                 continue
                             previous = scan.previous.get(key, ())
+                            if row.get("disputed_spelling"):
+                                disputed.add(key)
+                                if key not in scan.previous_disputed:
+                                    continue
                             agreed = row.get("corroborated_name")
+                            native = row.get("native_supported_name")
+                            if native:
+                                current_native[key] = native
+                            visual = row.get("visual_name")
+                            if visual:
+                                current_visual[key] = visual
+                            record = scan.stream_rows.get(key)
+                            prior_name = scan.confirmed_spellings.get(key)
+                            if record and (record.resolution or {}).get("status") == "resolved":
+                                prior_name = scan.confirmed_spellings[key] = record.resolution["name"]
+                            if agreed and agreed not in previous and (
+                                    (prior_name and agreed != prior_name) or (previous and not prior_name)):
+                                # One new frame can truncate the same letter in both
+                                # engines. Keep the established slot until it repeats.
+                                first_seen[key] = scan.capture_started
+                                continue
                             repeated = {agreed} if agreed else set(previous).intersection(current[key])
                             if row.get("independent_name"):
                                 repeated.intersection_update({row["independent_name"]})
@@ -436,10 +470,34 @@ class PrepController:
                             # name repeats. Check competing spellings from both frames, but
                             # require the winning spelling itself on both to publish an ID.
                             signature = (agreed,) if agreed else tuple(sorted(set(previous).union(current[key])))
+                            if native and native == scan.previous_native.get(key) and native in repeated:
+                                row = dict(row, stable_name=native)
+                                repeated.intersection_update({native})
+                            elif (not agreed and prior_name in repeated and prior_name != row.get("contradicted_name")
+                                  and record and record.signature == signature):
+                                if record.row.get("stable_name") == prior_name or record.row.get("corroborated_name") == prior_name:
+                                    row = dict(row, stable_name=prior_name)
+                            if prior_name and not agreed:
+                                repeated = {name for name in repeated if name == prior_name or name not in prior_name}
+                                if row.get("stable_name") not in repeated:
+                                    row.pop("stable_name", None)
+                            if key in disputed:
+                                # Even a sole exact website hit cannot settle two
+                                # credible, visually conflicting whole spellings.
+                                repeated = set()
+                                row.pop("stable_name", None)
                             row = dict(row, variants=list(signature), repeated_variants=sorted(repeated))
-                            record = scan.stream_rows.get(key)
+                            if agreed or row.get("stable_name"):
+                                scan.confirmed_spellings[key] = agreed or row["stable_name"]
+                            # Pixel-level fragment support changes only the display.
+                            # The same account candidates, repeated spellings and
+                            # name requests remain in force.
+                            if visual and visual == scan.previous_visual.get(key) and visual in repeated:
+                                row["stable_name"] = visual
                             if (record is not None and record.signature == signature and
-                                    record.row.get("repeated_variants") == row["repeated_variants"]):
+                                    record.row.get("repeated_variants") == row["repeated_variants"] and
+                                    record.row.get("contradicted_name") == row.get("contradicted_name")):
+                                record.row = copy.deepcopy(row)
                                 self._resume_row(scan, key, record)
                                 continue
                             if record is not None and self._reuse_resolved_subset(record, row, signature):
@@ -451,11 +509,18 @@ class PrepController:
                                                 1 if record is None else record.version + 1,
                                                 first_seen[key] + self.lookup_budget,
                                                 max(scan.deadline, first_seen[key] + self.total_budget))
-                            if len(signature) > _STREAM_VARIANT_LIMIT:
+                            if not repeated:
+                                record.attempted = True
+                                reason = ("完整读法相互冲突，等待更清晰的昵称或手动核对。" if key in disputed
+                                          else "当前只读到此前完整昵称的一部分，等待完整拼写。")
+                                record.resolution = _empty_resolution("incomplete", reason)
+                            elif len(signature) > _STREAM_VARIANT_LIMIT:
                                 record.attempted = True
                                 record.resolution = _empty_resolution("incomplete", "本行超过 12 个识别变体，保留待更清晰画面或手动核对；不会截取部分变体猜测身份。")
                             scan.stream_rows[key] = record
-                        scan.previous, scan.first_seen = current, first_seen
+                        scan.previous, scan.previous_native, scan.first_seen = current, current_native, first_seen
+                        scan.previous_visual = current_visual
+                        scan.previous_disputed = disputed
                         placeholders = (extracted.get("placeholder_counts") or {}).get("Bravo", 0)
                         if not current and placeholders:
                             self._status(scan, "names_unavailable", "敌方栏暂显示 Player name 占位文字；等待真实昵称出现后自动查询。",
@@ -473,6 +538,9 @@ class PrepController:
                     if not self._live(scan):
                         return
                     scan.previous = {}
+                    scan.previous_native = {}
+                    scan.previous_visual = {}
+                    scan.previous_disputed.clear()
                     scan.first_seen = {}
                     frame_status = frame.get("status") if isinstance(frame, dict) else None
                     self._status(scan, "capture_error", "准备画面暂不可用：" + str(exc)[:180], capture_status=frame_status)
@@ -500,6 +568,7 @@ class PrepController:
         if (previous.get("status") != "resolved" or not signature
                 or not set(signature).issubset(record.signature)
                 or normalize_name(previous["name"]) not in row["repeated_variants"]
+                or normalize_name(previous["name"]) == row.get("contradicted_name")
                 or set(record.batches) != set(record.signature)):
             return False
         batches = [(name, record.batches[name]) for name in row["variants"]]
@@ -692,7 +761,10 @@ class PrepController:
                         candidates = [candidate for _, batch in batches for candidate in batch]
                         decision = resolve_exact_name(record.row["variants"], candidates, query_results=batches)
                         if (decision["status"] == "resolved" and
-                                normalize_name(decision["name"]) not in record.row["repeated_variants"]):
+                                normalize_name(decision["name"]) == record.row.get("contradicted_name")):
+                            decision = _empty_resolution("incomplete", "昵称的实际字距或数字与此账号拼写冲突，等待更清晰的读数。", candidates)
+                        elif (decision["status"] == "resolved" and
+                              normalize_name(decision["name"]) not in record.row["repeated_variants"]):
                             decision = _empty_resolution("incomplete", "完整拼写尚未得到跨帧或独立读屏印证，继续等待。", candidates)
                         record.resolution = decision
                 record.pending = record.resolution is None
@@ -734,10 +806,11 @@ class PrepController:
                 deadlines[player_id] = scan.stream_rows[(row["team"], row["index"])].report_deadline
         final = sum(player["team"] == "Bravo" for player in players) == 5
         signature = (final, tuple((row["team"], row["index"], tuple(row["variants"]) if row["status"] != "missing" else (), row["status"],
+                                  row.get("corroborated_name") or row.get("stable_name"),
                                   row["resolution"].get("player_id"), row["resolution"].get("reason")) for row in rows))
         # A spelling corroborated by independent recognizers can be shown
         # while its account lookup is pending, without publishing a player ID.
-        has_display_data = any(record.resolution is not None or record.row.get("corroborated_name")
+        has_display_data = any(record.resolution is not None or record.row.get("corroborated_name") or record.row.get("stable_name")
                                for record in scan.stream_rows.values())
         if not force and (signature == scan.published_signature or
                           not has_display_data and scan.published_signature is None):

@@ -58,6 +58,61 @@ class FixedFrames:
 
 
 class StreamingTests(unittest.TestCase):
+    def test_two_full_script_readings_never_select_the_only_searchable_lookalike(self):
+        readings = dict(row(0, ["MapTa", "МарТа"]), competing_scripts=True)
+        calls = []
+        def search(name, timeout):
+            calls.append(name)
+            return [{"id": 102, "name": "MapTa"}] if name == "MapTa" else []
+        controller = self.controller(FixedFrames(readings, readings), search)
+        event = self.wait(controller, lambda e: e["type"] == "resolved" and e["rows"][0]["status"] == "incomplete")
+        self.assertEqual(event["players"], [])
+        self.assertCountEqual(event["rows"][0]["observed_variants"], ["MapTa", "МарТа"])
+        self.assertEqual(calls, [])
+
+    def test_new_dual_engine_spelling_must_repeat_before_replacing_a_known_slot(self):
+        original = dict(row(0, "Beacon49"), corroborated_name="Beacon49")
+        short = dict(row(0, "Beacon"), corroborated_name="Beacon")
+        new = dict(row(0, "Beacon47"), corroborated_name="Beacon47")
+        calls = []
+        def search(name, timeout):
+            calls.append(name)
+            return [{"name": name, "id": {"Beacon49": 49, "Beacon": 4, "Beacon47": 47}[name]}]
+        controller = self.controller(FixedFrames(original, short, original, new, new), search)
+        self.snapshot(controller, {47}, False)
+        self.assertCountEqual(calls, ["Beacon49", "Beacon47"])
+        self.assertTrue(all(p["id"] != 4 for e in self.events for p in e.get("players", [])))
+
+    def test_repeated_native_only_piece_cannot_replace_a_known_full_name_with_another_account(self):
+        original = dict(row(0, "Beacon49"), corroborated_name="Beacon49")
+        short = dict(row(0, "Beacon"), native_supported_name="Beacon")
+        def search(name, timeout):
+            self.calls.append(name)
+            return [{"name": name, "id": 49 if name == "Beacon49" else 4}]
+        controller = self.controller(FixedFrames(original, short, short, short), search)
+        event = self.wait(controller, lambda e: e["type"] == "resolved" and e["rows"][0]["status"] == "incomplete")
+        self.assertEqual(self.calls, ["Beacon49"])
+        self.assertFalse(event["players"])
+        self.assertFalse(event["rows"][0].get("stable_name"))
+        self.assertIn("Beacon", event["rows"][0]["observed_variants"])
+
+    def test_native_name_visible_only_after_two_captures_while_http_pending(self):
+        release = self.barrier()
+        def search(name, timeout):
+            release.wait(timeout)
+            return []
+        supported = dict(row(0, ["Тестовый Ветер", "Tectobblй Bеtep"]), native_supported_name="Тестовый Ветер")
+        controller = self.controller(FixedFrames(supported, supported), search)
+        event = self.wait(controller, lambda e: e["type"] == "resolved" and e["rows"][0].get("stable_name"))
+        self.assertEqual(event["rows"][0]["stable_name"], "Тестовый Ветер")
+        self.assertEqual(event["rows"][0]["status"], "searching")
+        self.assertFalse(event["players"])
+        controller.close()
+        self.events.clear()
+        single = self.controller(FixedFrames(supported), search)
+        self.wait(single, lambda e: e.get("status") == "capture_error" or e.get("capture_status") == "not_foreground")
+        self.assertFalse(any(e["type"] == "resolved" and e["rows"][0].get("stable_name") for e in self.events))
+
     def test_independent_agreement_can_query_one_real_frame(self):
         current = row(0, ["name0", "noise"])
         current.update(corroborated_name="name0", independent_name="name0")

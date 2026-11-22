@@ -74,6 +74,51 @@ def crop_candidates(long_name="VDV Guard :D", short_name="Guard", *, short_bbox=
 
 
 class PrepRosterTests(unittest.TestCase):
+    def test_second_model_view_can_recover_native_spelling_but_is_not_an_independent_engine(self):
+        value, regions = calibrated_frame()
+        reading = dict(team="Bravo", index=0, text="Brav0", confidence=.72, clipped=False,
+                       alternate_text="Bravo0", alternate_confidence=.98, alternate_clipped=False)
+        value["auxiliary_names"] = [reading]
+        get_row = lambda: extract_prep_roster(value, regions)["teams"]["Bravo"][0]
+        self.assertEqual(get_row().get("corroborated_name"), "Bravo0")
+        reading.update(text="Brav0", confidence=.95)
+        self.assertTrue(get_row().get("auxiliary_conflict"))
+        value["region_layout"].extend(dict(t, preprocessing="light_text_140_3x") for t in value["region_layout"][:])
+        value["results"].append(dict(value["results"][0], preprocessing="light_text_140_3x"))
+        result = get_row()
+        self.assertIsNone(result.get("corroborated_name"))
+        self.assertEqual(result["native_supported_name"], "Bravo0")
+        self.assertCountEqual(result["auxiliary_alternatives"], ["Brav0", "Bravo0"])
+        reading.update(text="Brav0", alternate_text="Brav0")
+        self.assertIsNone(get_row().get("corroborated_name"))
+        self.assertEqual(get_row()["independent_name"], "Brav0")
+        reading.update(confidence=.72, alternate_text="Bravo0", alternate_clipped=True)
+        self.assertIsNone(get_row().get("independent_name"))
+        reading.update(text="Bravo0", confidence=.95, alternate_text="Bravo 0", alternate_confidence=.91,
+                       alternate_clipped=False)
+        self.assertEqual(get_row()["corroborated_name"], "Bravo0")
+
+    def test_misread_partial_word_cannot_block_a_full_cyrillic_spelling_in_two_native_views(self):
+        value, regions = calibrated_frame()
+        first = value["results"][0]
+        first["language"] = "ru"
+        target = first["lines"][5]
+        target["text"] = target["words"][0]["text"] = "Яркий Ветер"
+        target["words"][0].update(x=1514, y=317, width=134, height=15)
+        value["region_layout"].extend(dict(t, preprocessing="light_text_140_3x") for t in value["region_layout"][:])
+        value["results"].append(dict(first, preprocessing="light_text_140_3x"))
+        right_word = dict(roi_index=5, text="", words=[dict(word("FX", 1590, 317, 16, 15), roi_index=5),
+                                                     dict(word("P", 1609, 317, 15, 15), roi_index=5)])
+        value["results"].append(dict(language="en-GB", preprocessing="colour_3x", lines=[right_word]))
+        get_row = lambda: extract_prep_roster(value, regions)["teams"]["Bravo"][0]
+        self.assertEqual(get_row().get("native_supported_name"), "Яркий Ветер")
+        rejected = next(v for v in get_row()["variants"] if v["text"] == "FX P")
+        self.assertFalse(rejected["queryable"])
+        self.assertIn("contained_name_fragment", rejected["issue_codes"])
+        right_word["words"][0].update(x=1515, width=88)
+        self.assertFalse(get_row()["queryable"])
+        self.assertIn("spacing_uncertain", get_row()["issue_codes"])
+
     def test_independent_evidence_is_bound_to_one_valid_slot_and_whole_name(self):
         value, regions = calibrated_frame()
         reading = dict(team="Bravo", index=0, text="Bravo0", confidence=.97, clipped=False)
@@ -105,7 +150,29 @@ class PrepRosterTests(unittest.TestCase):
         row = extract_prep_roster(value, regions)["teams"]["Bravo"][0]
         self.assertNotIn("corroborated_name", row)
         self.assertNotIn("independent_name", row)
+        self.assertNotIn("native_supported_name", row)
         self.assertIn("Вихрь", [v["text"] for v in row["variants"] if v["queryable"]])
+
+    def test_latin_and_cyrillic_whole_readings_stay_unlabelled_when_scripts_compete(self):
+        value, regions = calibrated_frame()
+        latin = value["results"][0]
+        target = latin["lines"][5]
+        target["text"] = target["words"][0]["text"] = "MapTa"
+        russian = deepcopy(latin)
+        russian["language"] = "ru"
+        target = russian["lines"][5]
+        target["text"] = target["words"][0]["text"] = "МарТа"
+        view = "light_text_140_3x"
+        value["region_layout"].extend(dict(t, preprocessing=view) for t in value["region_layout"][:])
+        value["results"].extend([russian, dict(latin, preprocessing=view), dict(russian, preprocessing=view)])
+        for extra in ([], [dict(team="Bravo", index=0, text="MapTa", confidence=.99, clipped=False)]):
+            value["auxiliary_names"] = extra
+            result = extract_prep_roster(value, regions)["teams"]["Bravo"][0]
+            self.assertTrue(result["queryable"])
+            self.assertTrue(result["competing_scripts"])
+            self.assertNotIn("native_supported_name", result)
+            self.assertNotIn("corroborated_name", result)
+            self.assertCountEqual([v["text"] for v in result["variants"] if v["queryable"]], ["MapTa", "МарТа"])
 
     def test_trailing_double_dot_fails_closed_even_when_two_engines_agree(self):
         value, regions = calibrated_frame()

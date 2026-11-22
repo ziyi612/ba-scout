@@ -41,6 +41,8 @@ _GEOMETRY = {"overlapping_regions", "boundary_crossing", "ocr_line_crosses_rows"
 _SUPPLEMENTAL = {"light_text_120_3x", "soft_text_185_3x"}
 _BLOCKING = _GEOMETRY | {"truncated_name", "control_characters", "duplicate_name", "numeric_name", "placeholder_name", "single_cjk_glyph"}
 _CJK_GAP = re.compile(r"(?<=[\u3400-\u4dbf\u4e00-\u9fff\U00020000-\U000323af])\s+(?=[\u3400-\u4dbf\u4e00-\u9fff\U00020000-\U000323af])")
+_HAN = r"[\u3400-\u4dbf\u4e00-\u9fff]"
+_HAN_DIGITS = re.compile(_HAN + r"{2,}[0-9]+")
 _UI_VALUE = re.compile(r"(?:\d+(?:[.,]\d+)?\s*[%％]|\d+\s*[/／]\s*\d+|\d{1,2}:\d{2}(?::\d{2})?|(?:lv\.?|level|等级|级别)\s*\d+)", re.IGNORECASE)
 
 
@@ -537,10 +539,11 @@ def _recover_corroborated_crop(row):
             continue
         incomplete = [v for v in originals if (issue in v["issue_codes"] if issue == "single_cjk_glyph" else
                       any(not obs["spacing_known"] for obs in v.get("observations", [])))]
+        intact = [v for v in originals if v["queryable"] and len(_intact_views(v)) >= 2]
         if not incomplete or not all(any(
-                len({obs["preprocessing"] for obs in other.get("observations", [])
-                     if obs["spacing_known"] and obs.get("usable", True)}) >= 2
-                for other in originals if other["text"] in v.get("contained_by", [])) for v in incomplete):
+                other["text"] in v.get("contained_by", []) or
+                (issue == "spacing_uncertain" and _partial_word_box(v, other))
+                for other in intact) for v in incomplete):
             continue
         invalid_obs = {id(obs) for v in incomplete for obs in v.get("observations", [])
                        if issue == "single_cjk_glyph" or not obs["spacing_known"]}
@@ -552,6 +555,196 @@ def _recover_corroborated_crop(row):
                 if "contained_name_fragment" not in variant["issue_codes"]:
                     variant["issue_codes"].append("contained_name_fragment")
         row["issue_codes"].remove(issue)
+
+
+def _intact_views(variant, language=None):
+    return {obs["preprocessing"] for obs in variant.get("observations", [])
+            if obs["spacing_known"] and obs.get("usable", True) and obs.get("preprocessing")
+            and (language is None or obs["language"].lower().split("-")[0] == language)}
+
+
+def _partial_word_box(fragment, whole):
+    # A segmentation pass can pick only the last word and misread every
+    # character. Its uncertain spacing does not describe the whole nickname.
+    x, y, width, height = whole["bbox"]
+    fx, _, fw, _ = fragment["bbox"]
+    return (fw <= width * .6 and max(fx - x, x + width - fx - fw) >= height
+            and _contains([x - 1, y - 1, width + 2, height + 2], fragment["bbox"]))
+
+
+def _russian_spelling(variant):
+    letters = [c for c in variant["text"] if c.isalpha()]
+    cyrillic = sum("CYRILLIC" in unicodedata.name(c, "") for c in letters)
+    return cyrillic >= 2 and cyrillic * 2 >= len(letters)
+
+
+def _native_evidence(row, usable):
+    literals = [v for v in usable if v["normalization"] == "none"]
+    russian = [v for v in literals if _russian_spelling(v) and len(_intact_views(v, "ru")) >= 2]
+    if russian:
+        # Russian OCR can consistently transliterate a Latin name across
+        # image treatments. A competing intact English reading leaves the
+        # script unresolved, even when the Russian string repeats in time.
+        english = [v for v in literals if not _russian_spelling(v) and len(_intact_views(v, "en")) >= 2]
+        if english:
+            row["competing_scripts"] = True
+        elif len(russian) == 1:
+            row["native_supported_name"] = russian[0]["text"]
+    elif len(usable) == 1 and len(literals) == 1 and len(_intact_views(literals[0])) >= 2:
+        row["native_supported_name"] = literals[0]["text"]
+
+
+def _adjacent_boxes(a, b, max_gap):
+    if a[0] > b[0]:
+        a, b = b, a
+    gap = b[0] - (a[0] + a[2])
+    h = min(a[3], b[3])
+    return (-1.25 <= gap <= min(max_gap, .25 * h)
+            and abs(a[1] + a[3] / 2 - b[1] - b[3] / 2) <= .25 * h)
+
+
+def _same_glyph_boxes(a, b):
+    return (_intersection(a, b) >= .65 * max(a[2] * a[3], b[2] * b[3])
+            and abs(a[0] + a[2] / 2 - b[0] - b[2] / 2) <= .2 * min(a[3], b[3]))
+
+
+def _edge_glyphs(name, words):
+    boxes = []
+    for char, word in zip(name, words):
+        box = word["bbox"]
+        if word["text"] != char or (boxes and not _adjacent_boxes(boxes[-1], box, 2.5)):
+            break
+        boxes.append(box)
+    return boxes
+
+
+def _ink_outside(lines, left, right):
+    # An additional, substantive glyph beyond either end can change a name.
+    for _, words in lines:
+        for word in words:
+            x, _, w, h = word["bbox"]
+            if x + w / 2 < left - .25 * h or x + w / 2 > right + .25 * h:
+                return True
+    return False
+
+
+def _han_edge_coverage(name, lines):
+    for reverse in (False, True):
+        target = name[::-1] if reverse else name
+        oriented = [(view, words[::-1] if reverse else words) for view, words in lines]
+        starts = [(view, _edge_glyphs(target, words)) for view, words in oriented]
+        ends = [(view, _edge_glyphs(target[::-1], words[::-1])[::-1]) for view, words in oriented]
+        for index, (view, a) in enumerate(starts):
+            for other, b in starts[index + 1:]:
+                length = min(len(a), len(b))
+                if (view == other or length < 4 or
+                        not all(_same_glyph_boxes(x, y) for x, y in zip(a[:length], b[:length]))):
+                    continue
+                for last, end in ends:
+                    offset = len(target) - len(end)
+                    if last in (view, other) or len(end) < 4 or length - offset < 3:
+                        continue
+                    if not all(_same_glyph_boxes(a[i], end[i - offset]) for i in range(offset, length)):
+                        continue
+                    combined = _union([a[0], end[-1]])
+                    if not _ink_outside(lines, combined[0], combined[0] + combined[2]):
+                        return True
+    return False
+
+
+def _chinese_readings(variants):
+    lines = []
+    for v in variants:
+        if v["normalization"] != "none" or (not v["queryable"] and v["issue_codes"] != ["ocr_inserted_spacing"]):
+            continue
+        for obs in v.get("observations", []):
+            words = obs["words"]
+            if (obs["language"].lower().split("-")[0] != "zh" or not obs["spacing_known"]
+                    or not obs.get("usable", True) or not obs.get("preprocessing")
+                    or len({w["line_id"] for w in words}) != 1):
+                continue
+            lines.append((obs["preprocessing"], words))
+    return lines
+
+
+def _contradicts_joined_name(name, lines):
+    # A printed space and the open sides of a narrow glyph can both look
+    # empty. Require the same enlarged word separation in two views, with
+    # evidence of extra advance compared to the rest of that line.
+    gaps_by_offset = defaultdict(set)
+    digit_views = defaultdict(set)
+    digits = re.fullmatch("(" + _HAN + r"{2,})([0-9]+)", name)
+    for view, words in lines:
+        compact = "".join(w["text"] for w in words)
+        if digits:
+            other = re.fullmatch(re.escape(digits[1]) + r"([0-9]+)", compact)
+            if other:
+                digit_views[other[1]].add(view)
+        if compact != name:
+            continue
+        boxes = [w["bbox"] for w in words]
+        gaps = [b[0] - a[0] - a[2] for a, b in zip(boxes, boxes[1:])]
+        offset = 0
+        for i, (a, b) in enumerate(zip(boxes, boxes[1:])):
+            offset += len(words[i]["text"])
+            height = min(a[3], b[3])
+            if gaps[i] < max(3, .22 * height):
+                continue
+            other_gaps = sorted(gaps[:i] + gaps[i + 1:])
+            typical = other_gaps[(len(other_gaps) - 1) // 2] if other_gaps else 0
+            extra = gaps[i] - max(0, typical)
+            advance = b[0] + b[2] / 2 - a[0] - a[2] / 2
+            if extra >= .18 * height and (gaps[i] >= .55 * height or advance >= 1.18 * height):
+                gaps_by_offset[offset].add(view)
+    if any(len(views) >= 2 for views in gaps_by_offset.values()):
+        return True
+    if not digits:
+        return False
+    rivals = set().union(*(views for number, views in digit_views.items() if number != digits[2]))
+    if not rivals:
+        return False
+    return len(rivals | digit_views[digits[2]]) >= 2
+
+
+def _visual_spelling(name, lines):
+    # Validate a complete PP reading without constructing a new candidate.
+    mixed = _HAN_DIGITS.fullmatch(name) is not None
+    if not mixed and not re.fullmatch(_HAN + r"{6,}", name):
+        return False
+    rival_views = defaultdict(set)
+    for view, words in lines:
+        compact = "".join(w["text"] for w in words)
+        if compact != name and len(compact) >= len(name) and re.fullmatch(_HAN + r"+[0-9]*", compact):
+            rival_views[compact].add(view)
+    if any(len(views) >= 2 for views in rival_views.values()):
+        return False
+    if not mixed:
+        return _han_edge_coverage(name, lines)
+    supported = set()
+    for view, words in lines:
+        if len(words) < 2 or "".join(w["text"] for w in words) != name:
+            continue
+        boxes = [word["bbox"] for word in words]
+        if any(b[0] - a[0] - a[2] >= max(3, .3 * min(a[3], b[3])) for a, b in zip(boxes, boxes[1:])):
+            return False
+        if (all(_adjacent_boxes(a, b, 1.05) for a, b in zip(boxes, boxes[1:]))
+                and not _ink_outside(lines, boxes[0][0], boxes[-1][0] + boxes[-1][2])):
+            supported.add(view)
+    return len(supported) >= 2
+
+
+def _auxiliary_spelling(obs, prefix):
+    name = obs.get(prefix + "text")
+    confidence = obs.get(prefix + "confidence")
+    if (not isinstance(name, str) or not 2 <= len(name.strip()) <= 128 or
+            type(confidence) not in (int, float) or not .90 <= confidence <= 1 or
+            obs.get(prefix + "clipped") is not False):
+        return None
+    name = unicodedata.normalize("NFC", name.strip())
+    if (any(unicodedata.category(c) in {"Cf", "Cs", "Cc"} for c in name) or _visibly_truncated(name) or
+            "".join(name.casefold().split()) == "playername" or _UI_VALUE.fullmatch(name)):
+        return None
+    return name
 
 
 def _attach_independent_names(rows, observations):
@@ -566,33 +759,39 @@ def _attach_independent_names(rows, observations):
         if len(matches) != 1:
             continue
         obs = matches[0]
-        name = obs.get("text")
-        confidence = obs.get("confidence")
-        if (not isinstance(name, str) or not 2 <= len(name.strip()) <= 128 or
-                type(confidence) not in (int, float) or not .90 <= confidence <= 1 or obs.get("clipped") is not False):
-            continue
-        name = unicodedata.normalize("NFC", name.strip())
-        if (any(unicodedata.category(c) in {"Cf", "Cs", "Cc"} for c in name) or
-                _visibly_truncated(name) or
-                "".join(name.casefold().split()) == "playername" or _UI_VALUE.fullmatch(name)):
+        names = list(dict.fromkeys(name for prefix in ("", "alternate_")
+                                   if (name := _auxiliary_spelling(obs, prefix))))
+        if not names:
             continue
         variants = row["variants"]
+        if len(names) > 1:
+            # The second view cannot overrule stronger primary/native
+            # agreement on its own. A competing spelling needs two native
+            # views plus another captured frame, or it remains pending.
+            native_matches = [v for v in variants if v["text"] in names and v["queryable"]
+                              and v["normalization"] == "none" and _intact_views(v)]
+            row["auxiliary_alternatives"] = names
+            if len(native_matches) != 1:
+                row["auxiliary_conflict"] = True
+                continue
+            name = native_matches[0]["text"]
+            primary_wins = name == names[0] and obs["confidence"] > obs["alternate_confidence"]
+            if not primary_wins and len(_intact_views(native_matches[0])) < 2:
+                row["auxiliary_conflict"] = True
+                continue
+        else:
+            name = names[0]
+            primary_wins = False
         match = next((v for v in variants if v["text"] == name), None)
         blockers = _BLOCKING.intersection(row["issue_codes"])
         # The auxiliary model is trained primarily on Chinese and English.
         # Its confidence cannot displace a competing Russian reading observed
         # by the native Russian recognizer in multiple preprocessing views.
-        russian_conflict = False
-        for variant in variants:
-            letters = [c for c in variant["text"] if c.isalpha()]
-            cyrillic = sum("CYRILLIC" in unicodedata.name(c, "") for c in letters)
-            russian_views = {o["preprocessing"] for o in variant.get("observations", [])
-                             if str(o["language"]).split("-")[0].lower() == "ru" and o.get("usable", True)}
-            if (variant["queryable"] and variant["text"] != name and cyrillic >= 2 and
-                    cyrillic * 2 >= len(letters) and len(russian_views) >= 2):
-                russian_conflict = True
-                break
+        russian_conflict = any(v["queryable"] and v["text"] != name and _russian_spelling(v)
+                               and len(_intact_views(v, "ru")) >= 2 for v in variants)
         if russian_conflict:
+            if match and match["queryable"] and _intact_views(match, "en"):
+                row["competing_scripts"] = True
             continue
         # Long digit-only handles must have been read in full in distinct
         # WinRT views in the calibrated name box as well as the independent model.
@@ -608,11 +807,17 @@ def _attach_independent_names(rows, observations):
                 blockers = set()
         if blockers or not any(v["queryable"] for v in variants):
             continue
+        chinese = _chinese_readings(variants) if re.fullmatch(_HAN + r"{2,}[0-9]*", name) else []
+        contradicted = _contradicts_joined_name(name, chinese)
         if match and match["queryable"]:
             # The same whole spelling from two different recognizers is usable
             # on the first frame. Alternate single-engine readings are still
             # retained for manual inspection. BATrace must uniquely match it.
-            row["corroborated_name"] = name
+            if not contradicted and not (_HAN_DIGITS.fullmatch(name) and match["normalization"] != "none"):
+                if len(names) == 1 or primary_wins:
+                    row["corroborated_name"] = name
+                else:
+                    row["native_supported_name"] = name
         elif not match:
             # A new spelling needs the next frame. The resolver checks rivals
             # as well and cannot publish a WinRT-only lookalike as this player.
@@ -622,6 +827,12 @@ def _attach_independent_names(rows, observations):
         else:
             continue
         row["independent_name"] = name
+        if contradicted:
+            row["contradicted_name"] = name
+        elif (not row.get("corroborated_name") and len(names) == 1 and
+                any(_auxiliary_spelling(obs, p) == name and obs[p + "confidence"] >= .95 for p in ("", "alternate_"))
+                and _visual_spelling(name, chinese)):
+            row["visual_name"] = name
 
 
 def extract_prep_roster(ocr_results, regions, *, image_size=None):
@@ -824,6 +1035,9 @@ def extract_prep_roster(ocr_results, regions, *, image_size=None):
             variant["manual_only"] = not variant["queryable"]
         row["variants"].sort(key=lambda value: (value["normalization"] != "none", value["text"]))
         usable = [v for v in row["variants"] if v["queryable"]]
+        if (crops and usable and not row.get("auxiliary_conflict") and not row.get("independent_name")
+                and not row.get("competing_scripts")):
+            _native_evidence(row, usable)
         row["queryable"] = row["valid"] = bool(usable)
         row["auto_confirmable"] = bool(usable) and len(row["variants"]) == 1
         row["name"] = usable[0]["text"] if row["auto_confirmable"] else None

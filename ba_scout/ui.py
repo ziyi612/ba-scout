@@ -87,6 +87,14 @@ def overview_fields(state, player_id):
     return fields, cached
 
 
+def prep_unconfirmed_note(row, fallback):
+    side = "对手" if row.get("team") == "Bravo" else "我方"
+    read_name = row.get("corroborated_name") or row.get("stable_name")
+    prefix = f"已读昵称 {read_name} · " if read_name else ""
+    reason = (row.get("resolution") or {}).get("reason") or row.get("reason") or fallback
+    return f"{side}第 {row.get('index', 0) + 1} 位：{prefix}{reason}"
+
+
 def prep_slot_status(row):
     decision = row.get("resolution") or {}
     status = decision.get("status") or row.get("status", "missing")
@@ -672,7 +680,7 @@ class ScoutWindow:
             if player is None:
                 row = row_info.get(index, {})
                 status = prep_slot_status(row)
-                read_name = row.get("corroborated_name")
+                read_name = row.get("corroborated_name") or row.get("stable_name")
                 name = read_name or f"对手 {index + 1}"
                 note = "已读昵称 · 账号待核对" if read_name else "—"
                 items.append((f"slot-{index}", (name, "—", note, "—", "—", status), "pending"))
@@ -852,7 +860,9 @@ class ScoutWindow:
             self.selected_id = None
             index = int(selection[0][5:])
             row = next((r for r in self.prep_rows if r.get("team") == "Bravo" and r.get("index") == index), {})
-            self.detail_title.set(f"对手 {index + 1} · {prep_slot_status(row)}")
+            read_name = row.get("corroborated_name") or row.get("stable_name")
+            heading = f"对手 {index + 1}" + (f" · {read_name}" if read_name else "")
+            self.detail_title.set(f"{heading} · {prep_slot_status(row)}")
             reason = (row.get("resolution") or {}).get("reason") or "等待本局该位置出现可确认的昵称。"
             variants = [v for v in row.get("variants", []) if isinstance(v, str) and v.strip()]
             if variants:
@@ -1386,7 +1396,7 @@ class ScoutWindow:
         for row in self.prep_rows:
             decision = row.get('resolution') or {}
             if decision.get('status') not in {'resolved', 'manual-confirmed'}:
-                notes.append(f"{'对手' if row.get('team') == 'Bravo' else '我方'}第 {row.get('index', 0)+1} 位：{decision.get('reason') or '等待稳定姓名后自动补查'}")
+                notes.append(prep_unconfirmed_note(row, "等待稳定姓名后自动补查"))
         roster = Roster(str(event['fight_id']), players, dt.datetime.now().astimezone().isoformat(), '', '',
                         source='screen_names', self_team='Alpha', identity_notes=notes)
         now = time.monotonic()
@@ -1576,7 +1586,7 @@ class ScoutWindow:
             for row in self.prep_rows:
                 decision = row.get('resolution') or {}
                 if decision.get('status') not in {'resolved', 'manual-confirmed'}:
-                    notes.append(f"{'对手' if row.get('team') == 'Bravo' else '我方'}第 {row.get('index', 0)+1} 位：{decision.get('reason') or row.get('reason') or '姓名或身份未确认'}")
+                    notes.append(prep_unconfirmed_note(row, "姓名或身份未确认"))
             roster = Roster(str(event['fight_id']), players, dt.datetime.now().astimezone().isoformat(), '', '',
                             source='screen_names' if event.get('source') == 'screen' else 'manual_names',
                             self_team='Alpha', identity_notes=notes)

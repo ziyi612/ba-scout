@@ -33,7 +33,7 @@ namespace BAScoutOCR {
       ((ISessionOptionsNative)options).SetIntraOpNumThreadsOverride(1);
     }
 
-    public static NameInput Prepare(Bitmap frame, double[] box) {
+    public static NameInput Prepare(Bitmap frame, double[] box, bool softContrast) {
       int left=(int)Math.Round(box[0]*frame.Width), top=(int)Math.Round(box[1]*frame.Height);
       int right=Math.Min(frame.Width,left+(int)Math.Round(box[2]*frame.Width));
       int bottom=Math.Min(frame.Height,top+(int)Math.Round(box[3]*frame.Height)+2);
@@ -51,11 +51,22 @@ namespace BAScoutOCR {
             lastInk=Math.Max(lastInk,x);
             if (x>=width-2 && y>=2 && y<height-2) edgeInk++;
           }
-          gray[y*width+x]=(byte)Math.Min(255,Math.Max(0,(int)((intensity-112)*2.1)));
+          // Colored backgrounds and antialiased strokes lose different detail in the two views.
+          int luminance=(77*c.R+150*c.G+29*c.B+128)>>8;
+          double level=softContrast ? (luminance-90)*1.7 : (intensity-112)*2.1;
+          gray[y*width+x]=(byte)Math.Min(255,Math.Max(0,(int)level));
         }
       }
       if (lastInk<0) return null;
       int cropped=Math.Min(width,lastInk+3);
+      if (softContrast) {
+        const int padding=3;
+        int paddedWidth=cropped+2*padding;
+        byte[] padded=new byte[height*paddedWidth];
+        for (int y=0;y<height;y++) Array.Copy(gray,y*width,padded,y*paddedWidth+padding,cropped);
+        gray=padded;
+        width=cropped=paddedWidth;
+      }
       int destWidth=(int)Math.Ceiling(48.0*cropped/height);
       if (destWidth<8 || destWidth>1024) return null;
       int plane=48*destWidth;

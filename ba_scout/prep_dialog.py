@@ -32,6 +32,7 @@ class PrepDialog:
         self.entries = {}
         self.selectors = {}
         self.candidates = {}
+        self.suggested_names = {}
         ttk.Label(names, style='BA.TLabel', text='我方 / 对方由你框选的区域决定。留空的人显示缺失；搜索同名时请选对数字 ID。',
                   wraplength=850, justify='left').grid(row=0, column=0, columnspan=3, sticky='w', padx=4, pady=(6, 10))
         for team_index, team in enumerate(('Bravo', 'Alpha')):
@@ -88,27 +89,33 @@ class PrepDialog:
         return bool(self.root.winfo_exists())
 
     def update_rows(self, rows):
-        # A partial/new generation must not retain unmentioned names or ID
-        # choices from the previous match in the editable form.
+        by_slot = {(row.get('team'), row.get('index')): row for row in rows}
         for key, entry in self.entries.items():
-            entry.set('')
-            self.selectors[key].set('')
-            self.selectors[key].config(values=[])
-            self.candidates[key] = {}
-        for row in rows:
-            key = (row.get('team'), row.get('index'))
-            if key not in self.entries:
-                continue
+            row = by_slot.get(key, {})
+            decision = row.get('resolution') or {}
             variants = row.get('variants') or row.get('observed_variants') or []
             first = variants[0] if variants else ''
             if isinstance(first, dict):
                 first = first.get('text', '')
-            decision = row.get('resolution') or {}
-            self.entries[key].set(row.get('name') or decision.get('name') or first)
+            suggested = (decision.get('name') or row.get('corroborated_name') or
+                         row.get('stable_name') or row.get('name') or first)
+            # A progressive update in the same room must not overwrite a correction
+            # while the user is typing, even if that slot is still absent from OCR.
+            # A room reset explicitly sends an empty row list.
+            edited = bool(rows) and key in self.suggested_names and entry.get() != self.suggested_names[key]
+            name = entry.get() if edited else suggested
+            selected = self.selectors[key].get()
+            if entry.get() != name:
+                entry.set(name)
+                selected = ''
             candidates = decision.get('candidates') or row.get('candidates') or []
             mapping = {f"{p['name']} · ID {p['id']}": p for p in candidates if p.get('id') and p.get('name')}
+            if edited and name != suggested:
+                mapping = {label: p for label, p in mapping.items() if p['name'] == name}
             self.candidates[key] = mapping
             self.selectors[key].config(values=list(mapping))
+            self.selectors[key].set(selected if selected in mapping else '')
+            self.suggested_names[key] = suggested
         self.note.set('已更新识别结果。若有同名、错字或缺失，修改后点击“按以上名单查询”。' if rows else
                       '暂无本局姓名。首次使用请先设置识别区域；也可在“名单校正”中输入完整名字立即查询。')
 

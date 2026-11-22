@@ -50,7 +50,9 @@ class _PlayerCard(tk.Frame):
         self.left = tk.Frame(self, bd=0)
         self.middle = tk.Frame(self, bd=0)
         self.right = tk.Frame(self, bd=0)
-        self.left.place(relx=0, x=14, relwidth=.35, width=-22, y=4, relheight=1, height=-8)
+        # Pending cards have no specialization column, so use that space for the nickname.
+        self.name_column_fraction = .61 if iid.startswith("slot-") else .35
+        self.left.place(relx=0, x=14, relwidth=self.name_column_fraction, width=-22, y=4, relheight=1, height=-8)
         self.middle.place(relx=.35, x=4, relwidth=.26, width=-14, y=2, relheight=1, height=-4)
         self.right.place(relx=.61, x=5, relwidth=.39, width=-19, y=2, relheight=1, height=-4)
 
@@ -143,7 +145,7 @@ class _PlayerCard(tk.Frame):
         width = self.winfo_width()
         if width <= 1:
             width = max(710, self.owner.winfo_width())
-        name_width = max(24, int(width * .35) - 25)
+        name_width = max(24, int(width * self.name_column_fraction) - 25)
         history = self.encounter.cget("text")
         if history:
             badge_width = self.encounter.winfo_reqwidth()
