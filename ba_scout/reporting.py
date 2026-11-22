@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import math
 from typing import Any
 
+from .encounter_tracker import encounter_label
 from .labels import short_combo
 from .metrics import profile_metrics, tied_top_count
 
@@ -278,6 +279,7 @@ def build_scout_report(
     *,
     is_replay: bool | None = None,
     advice: dict | None = None,
+    encounters: dict | None = None,
     data_summary: dict | None = None,
     opening20_states: dict | None = None,
     data_summary20: dict | None = None,
@@ -356,6 +358,11 @@ def build_scout_report(
         for player in members:
             player_id = player.get("id")
             lines.extend(["", f"【{_text(player.get('name'))}】ID {_identifier(player_id)} · {_text(player.get('team'))}"])
+            hits = _state(encounters, player_id)
+            if hits:
+                label = encounter_label(hits, detailed=True)
+                if label:
+                    lines.append("本机历史对局 · " + label)
             lines.extend(_core_lines(player_id, _state(states, player_id)))
             if dual_windows:
                 lines.extend(_opening_lines(_window_state(_state(opening20_states, player_id), 20), player_id in enemies,

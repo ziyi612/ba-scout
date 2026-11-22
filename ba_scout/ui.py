@@ -16,6 +16,7 @@ from tkinter import font as tkfont
 
 from .dialog_style import FONT as DIALOG_FONT, configure_dialog, fill_reader, reader
 from .engine import ScanController
+from .encounter_tracker import EncounterTracker, encounter_label
 from .player_cards import PlayerCards
 from .labels import short_combo, combo_country
 from .metrics import profile_metrics, tied_top_count
@@ -185,6 +186,7 @@ class ScoutWindow:
         self.selected_id = None
         self.last_log_error = None
         self.selftest_results = []
+        self.encounters = None
         self.cache_dir = ROOT / ("work/ui-test-cache" if args.self_test else "data/cache")
         self.request_gate = RequestGate(min_interval=0.65)
         self.controller = ScanController(str(self.cache_dir), self.fake_fetch if args.self_test else
@@ -198,6 +200,8 @@ class ScoutWindow:
         except (OSError, ValueError) as exc:
             self.watcher = None
             self.last_log_error = str(exc)
+        if not args.self_test and config["self_id"]:
+            self.encounters = EncounterTracker(ROOT / "data/encounters.sqlite3", config["self_id"], config["log_dir"])
         self._build()
         self._position()
         self.root.update_idletasks()
@@ -637,6 +641,12 @@ class ScoutWindow:
         return lines
 
     def render_rows(self):
+        tracker = getattr(self, "encounters", None)
+        if tracker:
+            is_live_fight = self.current_roster and self.current_roster.fight_id == self.live_fight_id
+            tracker.select(self.current_roster, before=getattr(self, "live_log_timestamp", None) if is_live_fight else None,
+                           replay=self.is_replay)
+        met = {str(pid): encounter_label(hits) for pid, hits in tracker.counts.items()} if tracker else {}
         previous = self.card_detail_id or (str(self.selected_id) if self.selected_id else None)
         existing = set(self.table.get_children())
         own = next((p["team"] for p in self.players if p["id"] == self.config["self_id"]),
@@ -660,8 +670,12 @@ class ScoutWindow:
         items = []
         for index, player in enumerate(rows):
             if player is None:
-                status = prep_slot_status(row_info.get(index, {}))
-                items.append((f"slot-{index}", (f"对手 {index + 1}", "—", "—", "—", "—", status), "pending"))
+                row = row_info.get(index, {})
+                status = prep_slot_status(row)
+                read_name = row.get("corroborated_name")
+                name = read_name or f"对手 {index + 1}"
+                note = "已读昵称 · 账号待核对" if read_name else "—"
+                items.append((f"slot-{index}", (name, "—", note, "—", "—", status), "pending"))
                 continue
             state = self.states.get(player["id"], {})
             status = state.get("status", "pending")
@@ -713,6 +727,7 @@ class ScoutWindow:
         self.cards.set_opening_label("最近整场" if self.analysis_mode == "recent" else
                                      self.opening_window_label() + "出兵")
         self.cards.set_rows(card_rows)
+        self.cards.set_encounters(met)
         empty = "该阵营暂无已确认的玩家" if self.players else "等待本场名单"
         self.cards.show_empty("" if items else empty)
         desired = {iid for iid, _, _ in items}
@@ -721,6 +736,8 @@ class ScoutWindow:
         for iid in existing - desired:
             self.table.delete(iid)
         for index, (iid, values, tag) in enumerate(items):
+            if iid in met:
+                values = (values[0] + "\n" + met[iid], *values[1:])
             tags = tuple(filter(None, (tag, "odd" if index % 2 else None)))
             if iid in existing:
                 self.table.item(iid, values=values, tags=tags)
@@ -821,6 +838,10 @@ class ScoutWindow:
             detail.append(f"排位 {number(games)} 场")
         if detail:
             title += " · " + " · ".join(detail)
+        tracker = getattr(self, "encounters", None)
+        history = encounter_label(tracker.counts.get(pid, {}), detailed=True) if tracker else ""
+        if history:
+            body += "\n本机对局 · " + history
         self.cards.show_detail(iid, title, body)
 
     def on_select(self, event=None):
@@ -832,7 +853,11 @@ class ScoutWindow:
             index = int(selection[0][5:])
             row = next((r for r in self.prep_rows if r.get("team") == "Bravo" and r.get("index") == index), {})
             self.detail_title.set(f"对手 {index + 1} · {prep_slot_status(row)}")
-            self.detail_text.set((row.get("resolution") or {}).get("reason") or "等待本局该位置出现可确认的昵称。")
+            reason = (row.get("resolution") or {}).get("reason") or "等待本局该位置出现可确认的昵称。"
+            variants = [v for v in row.get("variants", []) if isinstance(v, str) and v.strip()]
+            if variants:
+                reason = "待核对的拼写 · " + " / ".join(variants[:4]) + "\n" + reason
+            self.detail_text.set(reason)
             return
         self.selected_id = int(selection[0])
         player = next(p for p in self.players if p["id"] == self.selected_id)
@@ -889,7 +914,10 @@ class ScoutWindow:
         dialog.transient(self.root)
         text = reader(dialog)
         fields, cached = overview_fields(state, player_id)
-        lines = [f"{player['name']}   ·   ID {player_id}   ·   {player['team']}", "",
+        tracker = getattr(self, "encounters", None)
+        history = encounter_label(tracker.counts.get(player_id, {}), detailed=True) if tracker else ""
+        lines = [f"{player['name']}   ·   ID {player_id}   ·   {player['team']}",
+                 "本机对局 · " + history if history else "",
                  f"当前评分：{number(fields['rating'], 1)}    排名：{number(fields['rank'])}",
                  f"排位累计：{record(data)}    网站统计场数：{number(data.get('ranked_games'))}",
                  f"本地抓取：{local_time(data.get('fetched_at'))}", f"网站统计更新：{local_time(data.get('stats_updated_at'))}",
@@ -951,7 +979,9 @@ class ScoutWindow:
             self.status.set("尚无完整名单；名单写入游戏日志或手动历史测试后可导出。")
             return
         now = dt.datetime.now().astimezone()
+        tracker = getattr(self, "encounters", None)
         snapshot = dict(roster=asdict(self.current_roster), states=self.states,
+                        encounters=dict(tracker.counts) if tracker else {},
                         opening_states=self.opening_states, recon_states=self.recon_states,
                         enemy_ids=self.enemy_ids, opening_window_seconds=self.opening_window_seconds_active,
                         generated_at=now.isoformat(timespec="seconds"), is_replay=self.is_replay, data_summary=self.summary,
@@ -1117,6 +1147,8 @@ class ScoutWindow:
                     if event['type'] == 'lifecycle':
                         self.handle_lifecycle(event)
                     elif event['type'] == 'roster':
+                        if getattr(self, 'encounters', None):
+                            self.encounters.record(event['roster'])
                         if getattr(self, 'prep_controller', None) is not None:
                             if getattr(self, 'prep_generation', None) is not None:
                                 self.record_prep_event('cancelled', {'reason': 'authoritative_roster'})
@@ -1145,6 +1177,7 @@ class ScoutWindow:
         previous_fight_id = self.live_fight_id
         self.live_phase = event['phase']
         self.live_fight_id = event.get('fight_id')
+        self.live_log_timestamp = event.get('log_timestamp')
         if preserve_early:
             if getattr(self, 'prep_streaming', False) and self.prep_controller is not None:
                 self.record_prep_event('cancelled', {'reason': event['phase']})
@@ -1569,7 +1602,8 @@ class ScoutWindow:
                 self.toggle()
             elif hotkey == 102:
                 self.toggle_interact()
-        changed = False
+        tracker = getattr(self, "encounters", None)
+        changed = tracker.poll() if tracker else False
         if getattr(self, 'history_scan_id', None) != self.recon_scan_id:
             self.history_scan_id = self.recon_scan_id
             self.submitted_histories = {}
@@ -1719,6 +1753,11 @@ class ScoutWindow:
                 self.hotkeys.close()
                 self.hotkeys = Hotkeys()
                 self.hotkey_ok = (self.hotkeys.register(101, toggle), self.hotkeys.register(102, interact))
+                if (not self.args.self_test and
+                        (own_id != self.config["self_id"] or str(directory) != self.config["log_dir"])):
+                    if self.encounters:
+                        self.encounters.close()
+                    self.encounters = EncounterTracker(ROOT / "data/encounters.sqlite3", own_id, directory)
                 self.config.update(self_id=own_id, log_dir=str(directory), hotkey_toggle=toggle, hotkey_interact=interact,
                                    opening_window_seconds=window_seconds, opening_history_limit=history_limit)
                 self.watcher = LogWatcher(str(directory), include_existing=False)
@@ -1940,6 +1979,8 @@ class ScoutWindow:
                 atomic_json(ROOT / "config.json", self.config)
             except Exception:
                 logging.exception("Could not save config")
+        if self.encounters:
+            self.encounters.close()
         self.controller.close()
         self.recon.close()
         if self.prep_controller is not None:

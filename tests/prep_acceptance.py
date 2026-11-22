@@ -1,7 +1,7 @@
 """Opt-in Windows acceptance run with real WinRT OCR, Tk widgets and loopback HTTP.
 
 Run python -B tests/prep_acceptance.py. All names, web pages, frames and logs
-are synthetic. Only a WaitingRoom event is written. No live service is used.
+are synthetic. The current match contains only a WaitingRoom event. No live service is used.
 """
 from collections import Counter
 from datetime import datetime
@@ -69,6 +69,21 @@ def run():
     logs = directory / 'GameLogs'
     logs.mkdir(parents=True)
     log = logs / 'Gamelog__synthetic.log'
+    # Two earlier full matches belong to this local account. No ID list for the
+    # current match is supplied to either the OCR or the identity resolver.
+    prior = logs / "Gamelog__previous.log"
+    blocks = []
+    for game in range(2):
+        allies = [990001, PLAYERS["Cobra"], PLAYERS["Sable"] if game else 880030, 880031, 880032]
+        enemies = [PLAYERS["Raven"], 880033, PLAYERS["Sable"] if not game else 880034, 880035, 880036]
+        blocks.extend([f"[2025-12-{20 + game} 11:00:00.000]",
+                       f"Log: [NET_ROOM] GameRoom entered, fight id: {800000 + game}",
+                       "Log: Player list:"])
+        for team, ids in (("Alpha", allies), ("Bravo", enemies)):
+            blocks.extend(f"ID: {pid}, Name: Past{pid}, Team: {team}" for pid in ids)
+        blocks.append("")
+    prior.write_text("\n".join(blocks) + "\n", "utf-8")
+    os.utime(prior, (1700000000, 1700000000))
     log.touch()
     config = {**settings.DEFAULTS, 'self_id': 990001, 'click_through': True,
               'log_dir': str(logs), 'x': 24, 'y': 70,
@@ -203,7 +218,7 @@ def run():
             'only_preparation': window.live_phase == 'waiting' and window.current_roster is not None
                                 and window.current_roster.source == 'screen_names',
             'five_visible_slots': bool(snapshots) and all(len(rows) == 5 for _, rows in snapshots),
-            'one_at_a_time': sorted(set(sum(r['name'] in PLAYERS for r in rows) for _, rows in snapshots)) == list(range(6)),
+            'one_at_a_time': sorted(set(sum(not r['iid'].startswith('slot-') for r in rows) for _, rows in snapshots)) == list(range(6)),
             'first_stats_before_fifth_name': first_stats.get('Raven', 100) < ARRIVALS[-1],
             'independent_while_timed_out': first_stats.get('Cobra', 100) < first_stats.get(DELAYED, 0),
             'deadline_then_recovery': 'timeout' in [s for _, s in row_states]
@@ -217,8 +232,23 @@ def run():
             'both_opening_windows': all(window.opening_states.get(pid, {}).get('data', {}).get('sample_count') == 1
                                         and window.opening20_states.get(pid, {}).get('data', {}).get('sample_count') == 1
                                         for pid in PLAYERS.values()),
+            'encounters_by_id_and_side': bool(snapshots) and
+                [row['encounter'] for row in snapshots[-1][1]] ==
+                ['曾为对手', '', '曾为队友', '曾为对手 · 曾为队友', ''],
+            'read_before_id_has_no_stats_or_history': any(
+                r['iid'].startswith('slot-') and r['name'] in PLAYERS and not r['rating'] and not r['encounter']
+                for _, rows in snapshots for r in rows),
             'no_callback_errors': not errors,
         }
+        if window.current_roster and str(PLAYERS["Sable"]) in window.cards.cards:
+            window.activate_card(str(PLAYERS["Sable"]))
+            body = window.cards.detail_body.cget("text")
+            checks["both_relations_in_drawer"] = "曾为对手 1 场" in body and "曾为队友 1 场" in body
+            txt = window.export_report(copy_file=False)
+            exported = txt.read_text("utf-8-sig") if txt else ""
+            checks["encounters_in_report"] = "本机历史对局 · 曾为对手 1 场 · 曾为队友 1 场" in exported
+        else:
+            checks["both_relations_in_drawer"] = checks["encounters_in_report"] = False
         report = dict(passed=all(checks.values()), checks=checks, first_name_seconds=first_text,
                       first_stats_seconds=first_stats, delayed_slot=row_states, frames=frames, requests=protocol,
                       visible_cards=snapshots, errors=errors, data_source='Synthetic loopback HTTP; native OCR and Tk')

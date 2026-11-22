@@ -84,20 +84,33 @@ namespace BAScoutOCR {
         var tiles=new List<RegionTile>();
         using(var atlas=new Bitmap(atlasWidth,atlasHeight,PixelFormat.Format24bppRgb))
         using(var graphics=Graphics.FromImage(atlas)) {
-          graphics.Clear(Color.Black);
+          graphics.Clear(mode==2 ? Color.White : Color.Black);
           int top=pad;
           for(int variant=0;variant<views;variant++) for(int i=0;i<bounds.Length;i++) {
-            int kind=mode==0?variant:2;
+            int kind=mode==0?variant:mode+1;
             Rectangle sourceBox=bounds[i];
             int width=Math.Max(1,(int)Math.Floor(sourceBox.Width*scale));
             int height=Math.Max(1,(int)Math.Floor(sourceBox.Height*scale));
             using(var tile=new Bitmap(width,height,PixelFormat.Format24bppRgb)) {
+              using(var ink=kind==3 ? new Bitmap(sourceBox.Width,sourceBox.Height,PixelFormat.Format24bppRgb) : null)
               using(var g=Graphics.FromImage(tile)) {
                 g.InterpolationMode=System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
                 g.PixelOffsetMode=System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
-                g.DrawImage(source,new Rectangle(0,0,width,height),sourceBox,GraphicsUnit.Pixel);
+                if(ink==null) {
+                  g.DrawImage(source,new Rectangle(0,0,width,height),sourceBox,GraphicsUnit.Pixel);
+                } else {
+                  // Preserve antialiased stems and underscores before enlarging them.
+                  for(int y=0;y<ink.Height;y++) for(int x=0;x<ink.Width;x++) {
+                    Color c=source.GetPixel(sourceBox.X+x,sourceBox.Y+y);
+                    int light=Math.Min(c.R,Math.Min(c.G,c.B));
+                    int gray=255-Math.Min(255,Math.Max(0,(light-155)*255/60));
+                    ink.SetPixel(x,y,Color.FromArgb(gray,gray,gray));
+                  }
+                  g.Clear(Color.White);
+                  g.DrawImage(ink,new Rectangle(0,0,width,height),new Rectangle(0,0,ink.Width,ink.Height),GraphicsUnit.Pixel);
+                }
               }
-              if(kind>0) {
+              if(kind==1 || kind==2) {
                 int threshold=kind==1?140:120;
                 // Names in this layout use bright text on illustrated banners.
                 // Keep the original-colour variant too; never replace its text.
@@ -109,7 +122,7 @@ namespace BAScoutOCR {
               }
               graphics.DrawImageUnscaled(tile,pad,top);
             }
-            tiles.Add(new RegionTile {roi_index=i,preprocessing=kind==0?"colour_3x":kind==1?"light_text_140_3x":"light_text_120_3x",
+            tiles.Add(new RegionTile {roi_index=i,preprocessing=kind==0?"colour_3x":kind==1?"light_text_140_3x":kind==2?"light_text_120_3x":"soft_text_185_3x",
               source_bbox=new[]{sourceBox.X,sourceBox.Y,sourceBox.Width,sourceBox.Height},
               montage_bbox=new[]{pad,top,width,height}});
             top+=height+gap;
@@ -159,6 +172,16 @@ namespace BAScoutOCR {
     static CaptureResult Fail(string status, string message) {
       return new CaptureResult { ok=false, status=status, error=message };
     }
+    // The overlay can receive focus while the user reads the cards. Both
+    // focus checks still capture the verified game HWND only, never the desktop.
+    static bool EligibleForeground(IntPtr foreground, IntPtr game, int owner) {
+      if (foreground==IntPtr.Zero) return false;
+      IntPtr root=GetAncestor(foreground,2);
+      if (root==IntPtr.Zero) return false;
+      if (root==game) return true;
+      uint processId;
+      return owner>0 && GetWindowThreadProcessId(root,out processId)!=0 && processId==(uint)owner;
+    }
     static bool Occluded(IntPtr game, RECT client, int owner) {
       int guard=0;
       for (IntPtr h=GetWindow(game,3); h!=IntPtr.Zero && guard++<4096; h=GetWindow(h,3)) {
@@ -194,7 +217,7 @@ namespace BAScoutOCR {
       if (IsIconic(game)) return Fail("minimized","The game window is minimized.");
       if (!IsWindowVisible(game)) return Fail("not_visible","The game window is not visible.");
       IntPtr foreground=GetForegroundWindow();
-      if (requireForeground && GetAncestor(foreground,2)!=game) return Fail("not_foreground","The verified game is not the foreground window.");
+      if (requireForeground && !EligibleForeground(foreground,game,owner)) return Fail("not_foreground","Switch back to Broken Arrow or its scout overlay.");
       RECT r; POINT p=new POINT();
       if (!GetClientRect(game,out r) || !ClientToScreen(game,ref p)) return Fail("capture_failed","Game client bounds are unavailable.");
       int width=r.Right-r.Left, height=r.Bottom-r.Top;
@@ -213,7 +236,7 @@ namespace BAScoutOCR {
           try { printed=PrintWindow(game,dc,3); } finally { graphics.ReleaseHdc(dc); }
           if (!printed) return Fail("capture_failed","PrintWindow did not return an image.");
         }
-        if (IsIconic(game) || (requireForeground && GetAncestor(GetForegroundWindow(),2)!=game))
+        if (IsIconic(game) || (requireForeground && !EligibleForeground(GetForegroundWindow(),game,owner)))
           return Fail("window_changed","The game lost its capture eligibility during PrintWindow.");
         uint afterId;
         if (!String.Equals(Executable(game,out afterId),"BrokenArrow.exe",StringComparison.OrdinalIgnoreCase) || afterId!=processId)
@@ -351,6 +374,14 @@ function Read-OCR([string]$path, $requested) {
     }
 }
 
+$auxiliaryScript = Join-Path $PSScriptRoot 'name_ocr.ps1'
+if (Test-Path -LiteralPath $auxiliaryScript -PathType Leaf) {
+    . $auxiliaryScript
+} else {
+    function Initialize-NameRecognizer { $script:nameRecognizerStatus = 'unavailable' }
+    function Read-AuxiliaryNames($path, $regions) { Initialize-NameRecognizer }
+}
+
 function Read-RegionsOCR([string]$path, $requested, $regions) {
     $path = Assert-AbsolutePath $path
     if ([IO.Path]::GetExtension($path) -ine '.png' -or ![IO.File]::Exists($path)) { throw 'An existing PNG at an absolute path is required.' }
@@ -363,13 +394,13 @@ function Read-RegionsOCR([string]$path, $requested, $regions) {
         $limit = [Math]::Min(2600,[int][Windows.Media.Ocr.OcrEngine]::MaxImageDimension)
         $mappedResults = @(); $allWords = @(); $allTiles = @(); $montages = @()
         $response = $null; $firstLayout = $null; $totalSeconds = 0.0
-        foreach ($viewMode in @(0,1)) {
+        foreach ($viewMode in @(0,1,2)) {
         $layout = [BAScoutOCR.NameRegions]::Build($path,$montagePath,$boxes.ToArray(),$limit,$viewMode)
         $pass = Read-OCR $montagePath $requested
         if ($null -eq $response) { $response=$pass; $firstLayout=$layout }
         $totalSeconds += [double]$pass.seconds
         $allTiles += $layout.tiles
-        $viewNames = if ($viewMode -eq 0) { @('colour_3x','light_text_140_3x') } else { @('light_text_120_3x') }
+        $viewNames = if ($viewMode -eq 0) { @('colour_3x','light_text_140_3x') } elseif ($viewMode -eq 1) { @('light_text_120_3x') } else { @('soft_text_185_3x') }
         $montages += @{preprocessing=$viewNames;dimensions=@($layout.montage_width,$layout.montage_height);scale=$layout.scale}
         foreach ($result in $pass.results) {
             $groups = @{}
@@ -418,11 +449,16 @@ function Read-RegionsOCR([string]$path, $requested, $regions) {
         $response.seconds=$totalSeconds; $response.ocr_montages=$montages
         $response.image_path=$path; $response.image_width=$layout.image_width; $response.image_height=$layout.image_height
         $response.ocr_method='calibrated_name_regions'
-        $response.preprocessing=@('colour_3x','light_text_140_3x','light_text_120_3x')
+        $response.preprocessing=@('colour_3x','light_text_140_3x','light_text_120_3x','soft_text_185_3x')
         $response.region_scale=$firstLayout.scale
         $response.region_layout=$allTiles
         $response.regions=$regions
         $response.montage_dimensions=@($firstLayout.montage_width,$firstLayout.montage_height)
+        $auxiliaryTimer = [Diagnostics.Stopwatch]::StartNew()
+        $response.auxiliary_names = @(Read-AuxiliaryNames $path $regions)
+        $response.auxiliary_status = if ($script:nameFrameError) { 'frame_error' } else { $script:nameRecognizerStatus }
+        $response.auxiliary_seconds = [Math]::Round($auxiliaryTimer.Elapsed.TotalSeconds,4)
+        $response.seconds += $response.auxiliary_seconds
         return $response
     } finally {
         # This is a worker-created intermediate only. Keep the source PNG for UI.
@@ -442,6 +478,8 @@ while ($null -ne ($inputLine = [Console]::In.ReadLine())) {
         $capture = $null
         if ($request.op -eq 'warmup') {
             $response = Initialize-OCRLanguages $languages
+            Initialize-NameRecognizer
+            $response.auxiliary_status = $script:nameRecognizerStatus
             $response.operation = 'warmup'
             $response.results = @(); $response.words = @()
         } elseif ($request.op -eq 'capture') {

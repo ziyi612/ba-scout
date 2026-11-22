@@ -44,7 +44,50 @@ class ChangingOCR:
         return future
 
 
+class FixedFrames:
+    """Consume the recorded frames once. Losing focus cannot repeat a good frame."""
+    def __init__(self, *rows):
+        self.frames = iter(rows)
+
+    def submit_capture_game(self, **kwargs):
+        frame = next(self.frames, None)
+        future = Future()
+        future.set_result({"ok": True, "geometry_valid": True, "rows": [frame]} if frame else
+                          {"ok": False, "status": "not_foreground"})
+        return future
+
+
 class StreamingTests(unittest.TestCase):
+    def test_independent_agreement_can_query_one_real_frame(self):
+        current = row(0, ["name0", "noise"])
+        current.update(corroborated_name="name0", independent_name="name0")
+        controller = self.controller(FixedFrames(current))
+        self.snapshot(controller, {100}, False)
+        self.assertEqual([call[0] for call in self.calls], ["name0"])
+
+    def test_flickering_alternatives_require_repeated_winner_and_all_competing_queries(self):
+        for repeated_wins in (False, True):
+            with self.subTest(repeated_wins=repeated_wins):
+                def search(name, timeout):
+                    return [{"id": 164, "name": name}] if name == ("River" if repeated_wins else "Fliver") else []
+                ocr = FixedFrames(row(0, ["River", "Fliver"]), row(0, ["River", "Rivar"]))
+                controller = self.controller(ocr, search)
+                state = self.wait(controller, lambda e: e["type"] == "resolved" and
+                                  e["rows"][0]["status"] in ("incomplete", "resolved"))
+                self.assertEqual([p["id"] for p in state["players"]], [164] if repeated_wins else [])
+                self.assertEqual(state["name_requests"], 3)
+                controller.close()
+                self.events.clear()
+
+    def test_unconfirmed_independent_spelling_never_releases_other_lookalike(self):
+        current = row(0, ["Star_71", "Star-71"])
+        current["independent_name"] = "Star_71"
+        def search(name, timeout):
+            return [{"id": 71,"name": name}] if name == "Star-71" else []
+        controller = self.controller(FixedFrames(current, current), search)
+        event = self.wait(controller, lambda e: e["type"] == "resolved" and e["rows"][0]["status"] == "incomplete")
+        self.assertEqual(event["players"], [])
+
     def setUp(self):
         self.controllers = []
         self.releases = []
@@ -93,6 +136,34 @@ class StreamingTests(unittest.TestCase):
         value = threading.Event()
         self.releases.append(value)
         return value
+
+    def test_focus_lost_after_first_frame_recovers_after_initial_report(self):
+        class FocusOCR(ChangingOCR):
+            def __init__(self):
+                super().__init__({i: f"name{i}" for i in range(5)})
+                self.first_frame = True
+                self.game_back = threading.Event()
+
+            def submit_capture_game(self, **options):
+                if self.first_frame or self.game_back.is_set():
+                    self.first_frame = False
+                    return super().submit_capture_game(**options)
+                result = Future()
+                result.set_result({"ok": False, "status": "not_foreground", "error": "game lost focus"})
+                return result
+
+        ocr = FocusOCR()
+        controller = self.controller(ocr, total_budget=.18, lookup_budget=.12)
+        self.wait(controller, lambda e: e.get("capture_status") == "not_foreground")
+        first = self.wait(controller, lambda e: e["type"] == "resolved" and e.get("initial_report_ready"))
+        self.assertEqual(first["players"], [])
+        self.assertFalse(first["final"])
+        self.assertEqual(self.calls, [])
+        ocr.game_back.set()
+        result = self.snapshot(controller, set(range(100, 105)), final=True)
+        self.assertEqual(result["generation"], first["generation"])
+        self.assertTrue(all(deadline > first["initial_deadline"] for deadline in result["player_deadlines"].values()))
+        self.assertEqual(Counter(name for name, _, _ in self.calls), Counter(f"name{i}" for i in range(5)))
 
     def test_first_player_then_late_fourth_fifth_continue_after_initial_deadline(self):
         ocr = ChangingOCR({0: "name0"})

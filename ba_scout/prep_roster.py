@@ -38,6 +38,7 @@ _MESSAGES = {
 }
 _GEOMETRY = {"overlapping_regions", "boundary_crossing", "ocr_line_crosses_rows",
              "overlapping_words", "multiple_text_lines", "spacing_uncertain", "crop_metadata_mismatch"}
+_SUPPLEMENTAL = {"light_text_120_3x", "soft_text_185_3x"}
 _BLOCKING = _GEOMETRY | {"truncated_name", "control_characters", "duplicate_name", "numeric_name", "placeholder_name", "single_cjk_glyph"}
 _CJK_GAP = re.compile(r"(?<=[\u3400-\u4dbf\u4e00-\u9fff\U00020000-\U000323af])\s+(?=[\u3400-\u4dbf\u4e00-\u9fff\U00020000-\U000323af])")
 _UI_VALUE = re.compile(r"(?:\d+(?:[.,]\d+)?\s*[%％]|\d+\s*[/／]\s*\d+|\d{1,2}:\d{2}(?::\d{2})?|(?:lv\.?|level|等级|级别)\s*\d+)", re.IGNORECASE)
@@ -168,7 +169,7 @@ def _calibrated_crops(frame, rows, image_size):
         roi_index = tile["roi_index"]
         preprocessing = tile.get("preprocessing")
         if (roi_index not in source_rows or not isinstance(preprocessing, str)
-                or preprocessing not in {"colour_3x", "light_text_140_3x", "light_text_120_3x"}):
+                or preprocessing not in ({"colour_3x", "light_text_140_3x"} | _SUPPLEMENTAL)):
             raise ValueError("unrecognized crop source")
         key = roi_index, preprocessing
         if key in crops:
@@ -217,6 +218,12 @@ def _cluster_text(words):
     return original, False
 
 
+def _visibly_truncated(text):
+    # A clipped three-dot ellipsis can itself lose its last dot in OCR.
+    text = unicodedata.normalize("NFKC", text).strip()
+    return text.endswith("..") or "..." in text or "⋯" in text
+
+
 def _numeric(text):
     return any(char.isdecimal() for char in text) and all(char.isdecimal() or char.isspace() or char in ".,，+-−" for char in text)
 
@@ -240,7 +247,7 @@ def _without_detached_numeric_texture(words, peers, row):
     area, numeric = row["bbox"], noise["bbox"]
     gap = numeric[0] - (bounds[0] + bounds[2])
     if (not known or len(name) < 2 or not any(char.isalpha() for char in name)
-            or any(token in name for token in ("…", "...", "⋯"))
+            or _visibly_truncated(name)
             or numeric[0] < area[0] + area[2] * .8
             or gap < max(area[2] * .25, 4 * min(bounds[3], numeric[3]))):
         return words
@@ -292,6 +299,23 @@ def _touching_cjk_spacing_candidate(words):
     return candidate if changed_mixed and candidate != original else None
 
 
+def _han_dot_candidate(words):
+    # Chinese WinRT can surround a middle dot with synthesized spaces just as
+    # it separates Han glyphs. Require the dot and both sides in the pixels.
+    chars = [word["text"] for word in words]
+    text = "".join(chars)
+    if not re.fullmatch(r"[㐀-鿿]+(?:·[㐀-鿿]+)+", text):
+        return None
+    if any(len(char) != 1 for char in chars) or len({word["line_id"] for word in words}) != 1:
+        return None
+    for left, right in zip(words, words[1:]):
+        a, b = left["bbox"], right["bbox"]
+        gap = b[0] - a[0] - a[2]
+        if not -1 <= gap <= .25 * max(a[3], b[3]):
+            return None
+    return text
+
+
 def _variant(row, text, language, bbox, normalization, original):
     text = unicodedata.normalize("NFC", text.strip())
     codes = []
@@ -299,7 +323,7 @@ def _variant(row, text, language, bbox, normalization, original):
         codes.append('placeholder_name')
     if re.fullmatch(r'[\u3400-\u4dbf\u4e00-\u9fff]', text):
         codes.append('single_cjk_glyph')
-    if "…" in text or "..." in text or "⋯" in text:
+    if _visibly_truncated(text):
         codes.append("truncated_name")
     if any(unicodedata.category(char) in {"Cc", "Cf"} for char in text):
         codes.append("control_characters")
@@ -504,6 +528,102 @@ def _suppress_contained_fragments(row):
             _issue(row, "contained_name_fragment")
 
 
+def _recover_corroborated_crop(row):
+    """A fragment from another pass need not veto an intact repeated reading."""
+    variants = row["variants"]
+    originals = [v for v in variants if v["normalization"] == "none"]
+    for issue in ("single_cjk_glyph", "spacing_uncertain"):
+        if issue not in row["issue_codes"]:
+            continue
+        incomplete = [v for v in originals if (issue in v["issue_codes"] if issue == "single_cjk_glyph" else
+                      any(not obs["spacing_known"] for obs in v.get("observations", [])))]
+        if not incomplete or not all(any(
+                len({obs["preprocessing"] for obs in other.get("observations", [])
+                     if obs["spacing_known"] and obs.get("usable", True)}) >= 2
+                for other in originals if other["text"] in v.get("contained_by", [])) for v in incomplete):
+            continue
+        invalid_obs = {id(obs) for v in incomplete for obs in v.get("observations", [])
+                       if issue == "single_cjk_glyph" or not obs["spacing_known"]}
+        for variant in variants:
+            observed = variant.get("observations", [])
+            if observed and all(id(obs) in invalid_obs for obs in observed):
+                variant["queryable"] = False
+                variant["manual_only"] = True
+                if "contained_name_fragment" not in variant["issue_codes"]:
+                    variant["issue_codes"].append("contained_name_fragment")
+        row["issue_codes"].remove(issue)
+
+
+def _attach_independent_names(rows, observations):
+    if not isinstance(observations, list) or len(observations) > len(rows):
+        return
+    by_slot = defaultdict(list)
+    for obs in observations:
+        if isinstance(obs, dict) and obs.get("team") in _TEAMS and type(obs.get("index")) is int:
+            by_slot[(obs["team"], obs["index"])].append(obs)
+    for row in rows:
+        matches = by_slot[row["team"], row["index"]]
+        if len(matches) != 1:
+            continue
+        obs = matches[0]
+        name = obs.get("text")
+        confidence = obs.get("confidence")
+        if (not isinstance(name, str) or not 2 <= len(name.strip()) <= 128 or
+                type(confidence) not in (int, float) or not .90 <= confidence <= 1 or obs.get("clipped") is not False):
+            continue
+        name = unicodedata.normalize("NFC", name.strip())
+        if (any(unicodedata.category(c) in {"Cf", "Cs", "Cc"} for c in name) or
+                _visibly_truncated(name) or
+                "".join(name.casefold().split()) == "playername" or _UI_VALUE.fullmatch(name)):
+            continue
+        variants = row["variants"]
+        match = next((v for v in variants if v["text"] == name), None)
+        blockers = _BLOCKING.intersection(row["issue_codes"])
+        # The auxiliary model is trained primarily on Chinese and English.
+        # Its confidence cannot displace a competing Russian reading observed
+        # by the native Russian recognizer in multiple preprocessing views.
+        russian_conflict = False
+        for variant in variants:
+            letters = [c for c in variant["text"] if c.isalpha()]
+            cyrillic = sum("CYRILLIC" in unicodedata.name(c, "") for c in letters)
+            russian_views = {o["preprocessing"] for o in variant.get("observations", [])
+                             if str(o["language"]).split("-")[0].lower() == "ru" and o.get("usable", True)}
+            if (variant["queryable"] and variant["text"] != name and cyrillic >= 2 and
+                    cyrillic * 2 >= len(letters) and len(russian_views) >= 2):
+                russian_conflict = True
+                break
+        if russian_conflict:
+            continue
+        # Long digit-only handles must have been read in full in distinct
+        # WinRT views in the calibrated name box as well as the independent model.
+        if blockers == {"numeric_name"} and re.fullmatch(r"(?:[0-9]{6,20}|0[0-9]{2,4})", name) and match:
+            if (match["bbox"][0] <= row["bbox"][0] + row["bbox"][2] * .08 and
+                    len({o["preprocessing"] for o in match.get("observations", [])}) >= 2 and
+                    all(v["text"] == name or "supplemental_unusable" in v["issue_codes"] or
+                        (" " in v["text"] and _numeric(v["text"]) and
+                         len(v["text"].replace(" ", "")) < len(name)) for v in variants)):
+                row["issue_codes"].remove("numeric_name")
+                match["issue_codes"].remove("numeric_name")
+                match.update(queryable=True, manual_only=False)
+                blockers = set()
+        if blockers or not any(v["queryable"] for v in variants):
+            continue
+        if match and match["queryable"]:
+            # The same whole spelling from two different recognizers is usable
+            # on the first frame. Alternate single-engine readings are still
+            # retained for manual inspection. BATrace must uniquely match it.
+            row["corroborated_name"] = name
+        elif not match:
+            # A new spelling needs the next frame. The resolver checks rivals
+            # as well and cannot publish a WinRT-only lookalike as this player.
+            match = _variant(row, name, "PP-OCR", row["bbox"], "independent_crop", name)
+            if not match["queryable"]:
+                continue
+        else:
+            continue
+        row["independent_name"] = name
+
+
 def extract_prep_roster(ocr_results, regions, *, image_size=None):
     """Return ten calibrated rows and exact-name candidates, without any I/O.
 
@@ -515,7 +635,7 @@ def extract_prep_roster(ocr_results, regions, *, image_size=None):
 
     Raises ValueError for absent/invalid calibration or image dimensions.
     A row can be queryable while other rows are absent. Variant disagreement
-    needs exact-name resolution; pure numeric/truncated names need manual input.
+    needs exact-name resolution. Digit-only names need strong crop evidence.
     CJK spacing variants preserve both originals and compact alternatives.
     ``complete`` means every row has some candidate, not verified identities.
     """
@@ -602,17 +722,17 @@ def extract_prep_roster(ocr_results, regions, *, image_size=None):
                     for row_index in indices:
                         _issue(rows[row_index], "ocr_line_crosses_rows")
     # Keep the original colour/140 passes authoritative for their existing
-    # eligibility checks. The added 120 view cannot poison a valid base name
+    # eligibility checks. A supplemental view cannot poison a valid base name
     # merely because that extra pass found only a numeric/spacing fragment.
     for (row_index, result_index, language), words in sorted(
-            assigned.items(), key=lambda item: results[item[0][1]].get("preprocessing") == "light_text_120_3x"):
+            assigned.items(), key=lambda item: results[item[0][1]].get("preprocessing") in _SUPPLEMENTAL):
         row = rows[row_index]
         prior_issues = set(row["issue_codes"])
         previous_variants = {variant["text"] for variant in row["variants"]}
-        primary_usable = (bool(crops) and results[result_index].get("preprocessing") == "light_text_120_3x"
+        primary_usable = (bool(crops) and results[result_index].get("preprocessing") in _SUPPLEMENTAL
                           and not _BLOCKING.intersection(prior_issues)
                           and any(variant["queryable"] and any(
-                              observation["preprocessing"] != "light_text_120_3x" for observation in variant.get("observations", []))
+                              observation["preprocessing"] not in _SUPPLEMENTAL for observation in variant.get("observations", []))
                                   for variant in row["variants"]))
         pass_observations = []
         if crops:
@@ -636,13 +756,16 @@ def extract_prep_roster(ocr_results, regions, *, image_size=None):
             if not spacing_known:
                 _issue(row, "spacing_uncertain")
             observation = {"language": language, "preprocessing": results[result_index].get("preprocessing"),
-                           "text": text, "words": cluster}
+                           "text": text, "words": cluster, "spacing_known": spacing_known}
             pass_observations.append(observation)
             _variant(row, text, language, bbox, "none", text).setdefault("observations", []).append(observation)
             compact = _CJK_GAP.sub("", text)
             if compact != text:
                 _variant(row, compact, language, bbox, "cjk_adjacent_whitespace_removed", text).setdefault("observations", []).append(observation)
             if crops:
+                compact_dot = _han_dot_candidate(cluster) if spacing_known else None
+                if compact_dot and compact_dot != text:
+                    _variant(row, compact_dot, language, bbox, "cjk_dot_spacing", text).setdefault("observations", []).append(observation)
                 touching = _touching_cjk_spacing_candidate(cluster)
                 if touching is not None:
                     _variant(row, touching, language, bbox, "geometry_adjacent_whitespace_removed", text).setdefault("observations", []).append(observation)
@@ -671,7 +794,9 @@ def extract_prep_roster(ocr_results, regions, *, image_size=None):
     if crops:
         for row in rows:
             _suppress_contained_fragments(row)
+            _recover_corroborated_crop(row)
             _prune_unsupported_observations(row)
+        _attach_independent_names(rows, frame.get("auxiliary_names"))
     # Never resolve identical names to distinct player positions automatically.
     owners = defaultdict(set)
     for row_index, row in enumerate(rows):

@@ -74,6 +74,64 @@ def crop_candidates(long_name="VDV Guard :D", short_name="Guard", *, short_bbox=
 
 
 class PrepRosterTests(unittest.TestCase):
+    def test_independent_evidence_is_bound_to_one_valid_slot_and_whole_name(self):
+        value, regions = calibrated_frame()
+        reading = dict(team="Bravo", index=0, text="Bravo0", confidence=.97, clipped=False)
+        for changes, wanted in (({}, "Bravo0"), ({"clipped": True}, None), ({"confidence": .7}, None),
+                                ({"text": "Bravo…"}, None), ({"text": "Player name"}, None)):
+            value["auxiliary_names"] = [dict(reading, **changes)]
+            result = extract_prep_roster(value, regions)["teams"]["Bravo"][0]
+            self.assertEqual(result.get("corroborated_name"), wanted)
+        value["auxiliary_names"] = [reading, reading]
+        self.assertNotIn("corroborated_name", extract_prep_roster(value, regions)["teams"]["Bravo"][0])
+        value["auxiliary_names"] = [dict(reading, text="BravO0")]
+        result = extract_prep_roster(value, regions)["teams"]["Bravo"][0]
+        self.assertEqual(result["independent_name"], "BravO0")
+        self.assertNotIn("corroborated_name", result)
+
+    def test_chinese_english_model_does_not_displace_a_corroborated_russian_reading(self):
+        value, regions = calibrated_frame()
+        russian = deepcopy(value["results"][0])
+        russian.update(language="ru")
+        target = russian["lines"][5]
+        target["text"] = target["words"][0]["text"] = "Вихрь"
+        value["results"].append(russian)
+        tiles = deepcopy(value["region_layout"])
+        for tile in tiles:
+            tile["preprocessing"] = "light_text_140_3x"
+        value["region_layout"].extend(tiles)
+        value["results"].append(dict(russian, preprocessing="light_text_140_3x"))
+        value["auxiliary_names"] = [dict(team="Bravo", index=0, text="Bravo0", confidence=.99, clipped=False)]
+        row = extract_prep_roster(value, regions)["teams"]["Bravo"][0]
+        self.assertNotIn("corroborated_name", row)
+        self.assertNotIn("independent_name", row)
+        self.assertIn("Вихрь", [v["text"] for v in row["variants"] if v["queryable"]])
+
+    def test_trailing_double_dot_fails_closed_even_when_two_engines_agree(self):
+        value, regions = calibrated_frame()
+        target = value["results"][0]["lines"][5]
+        for name, allowed in (("Long name..", False), ("Long name.", True), ("Long na…", False)):
+            target["text"] = target["words"][0]["text"] = name
+            value["auxiliary_names"] = [dict(team="Bravo", index=0, text=name, confidence=.99, clipped=False)]
+            row = extract_prep_roster(value, regions)["teams"]["Bravo"][0]
+            self.assertEqual(row["queryable"], allowed)
+            self.assertEqual(bool(row.get("corroborated_name")), allowed)
+
+    def test_numeric_handle_needs_two_views_and_independent_agreement_at_name_origin(self):
+        value, regions = calibrated_frame()
+        target = value["results"][0]["lines"][5]
+        target["text"] = target["words"][0]["text"] = "007"
+        value["auxiliary_names"] = [dict(team="Bravo", index=0, text="007", confidence=.99, clipped=False)]
+        self.assertFalse(extract_prep_roster(value, regions)["teams"]["Bravo"][0]["queryable"])
+        tiles = deepcopy(value["region_layout"])
+        for tile in tiles:
+            tile["preprocessing"] = "light_text_140_3x"
+        value["region_layout"].extend(tiles)
+        value["results"].append(dict(value["results"][0], preprocessing="light_text_140_3x"))
+        self.assertEqual(extract_prep_roster(value, regions)["teams"]["Bravo"][0]["corroborated_name"], "007")
+        target["words"][0]["x"] += 24
+        self.assertFalse(extract_prep_roster(value, regions)["teams"]["Bravo"][0]["queryable"])
+
     def test_independently_observed_edge_punctuation_names_both_require_resolution(self):
         for long_name in ("SamplePlayer-", "-SamplePlayer", "[SamplePlayer]",
                           "SamplePlayer_", "SamplePlayer：", "“SamplePlayer”"):

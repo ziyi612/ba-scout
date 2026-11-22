@@ -1,8 +1,8 @@
 """Bounded preparation-screen identity lookup; no Tk or game-state manipulation.
 
 The UI must start this controller only for an explicit waiting/preparation
-state and calibrated regions. Each Bravo row must be queryable and stable in
-consecutive frames. Later rows are collected while earlier rows are queried.
+state and calibrated regions. A name needs independent recognizer agreement or a
+spelling repeated on consecutive captures. Later rows are collected while earlier rows are queried.
 Bravo is a screen-side label, not inferred from
 an OCR nickname. Partial identities remain unconfirmed by the game's ID log.
 
@@ -160,6 +160,13 @@ def _prepare_rows(raw_rows, manual=False):
                         value = variant
                     names.append(normalize_name(value))
                 row["variants"] = list(dict.fromkeys(names))
+                for field in ("corroborated_name", "independent_name"):
+                    if not manual and isinstance(raw.get(field), str):
+                        verified = normalize_name(raw[field])
+                        if verified in names:
+                            row[field] = verified
+                if row.get("corroborated_name"):
+                    row["variants"] = [row["corroborated_name"]]
                 row["queryable"] = bool(names) and (manual or raw.get("queryable") is True)
                 if raw.get("valid") is False and not manual:
                     row["queryable"] = False
@@ -179,8 +186,8 @@ class PrepController:
     always start a new round, and may contain one row or explicit player_id/name.
 
     Automatic rounds publish complete roster snapshots incrementally. Each
-    enemy row needs two consecutive stable frames and gets its own lookup
-    window; later names keep being captured after the initial 20-second report.
+    enemy row gets an independent lookup window when two recognizers agree
+    on the same full spelling or consecutive frames corroborate the name; later names keep being captured after the initial 20-second report.
     ``revision`` orders snapshots, ``final`` means all five enemy slots were
     confirmed, and ``player_deadlines`` bounds each newly observed identity's
     data fetch. The first report deadline never moves. Unchanged successful
@@ -416,14 +423,23 @@ class PrepController:
                             key = row["team"], row["index"]
                             if key not in current:
                                 continue
-                            signature = current[key]
-                            stable = scan.previous.get(key) == signature
-                            first_seen[key] = scan.first_seen.get(key, scan.capture_started) if stable else scan.capture_started
-                            if not stable:
+                            previous = scan.previous.get(key, ())
+                            agreed = row.get("corroborated_name")
+                            repeated = {agreed} if agreed else set(previous).intersection(current[key])
+                            if row.get("independent_name"):
+                                repeated.intersection_update({row["independent_name"]})
+                            first_seen[key] = scan.first_seen.get(key, scan.capture_started) if repeated else scan.capture_started
+                            if not repeated:
                                 continue
                             stable_count += 1
+                            # Animation may change an OCR alternative even as the complete
+                            # name repeats. Check competing spellings from both frames, but
+                            # require the winning spelling itself on both to publish an ID.
+                            signature = (agreed,) if agreed else tuple(sorted(set(previous).union(current[key])))
+                            row = dict(row, variants=list(signature), repeated_variants=sorted(repeated))
                             record = scan.stream_rows.get(key)
-                            if record is not None and record.signature == signature:
+                            if (record is not None and record.signature == signature and
+                                    record.row.get("repeated_variants") == row["repeated_variants"]):
                                 self._resume_row(scan, key, record)
                                 continue
                             if record is not None and self._reuse_resolved_subset(record, row, signature):
@@ -448,7 +464,7 @@ class PrepController:
                             self._status(scan, "searching", f"已取得 {stable_count}/5 行稳定对手昵称；逐人查询，继续读取其余姓名。")
                         else:
                             self._status(scan, "stabilizing" if scan.started is not None else "waiting",
-                                         f"等待连续两帧稳定昵称：当前可查询 {len(current)}/5 行，已稳定 0/5 行。")
+                                         f"等待读屏印证：当前可查询 {len(current)}/5 行，已稳定 0/5 行。")
                         self._stream_schedule(scan)
                         self._stream_publish(scan)
                     self._stream_tick(scan)
@@ -483,7 +499,7 @@ class PrepController:
         previous = record.resolution or {}
         if (previous.get("status") != "resolved" or not signature
                 or not set(signature).issubset(record.signature)
-                or normalize_name(previous["name"]) not in signature
+                or normalize_name(previous["name"]) not in row["repeated_variants"]
                 or set(record.batches) != set(record.signature)):
             return False
         batches = [(name, record.batches[name]) for name in row["variants"]]
@@ -674,7 +690,11 @@ class PrepController:
                     if len(record.batches) == len(record.row["variants"]):
                         batches = [(name, record.batches[name]) for name in record.row["variants"]]
                         candidates = [candidate for _, batch in batches for candidate in batch]
-                        record.resolution = resolve_exact_name(record.row["variants"], candidates, query_results=batches)
+                        decision = resolve_exact_name(record.row["variants"], candidates, query_results=batches)
+                        if (decision["status"] == "resolved" and
+                                normalize_name(decision["name"]) not in record.row["repeated_variants"]):
+                            decision = _empty_resolution("incomplete", "完整拼写尚未得到跨帧或独立读屏印证，继续等待。", candidates)
+                        record.resolution = decision
                 record.pending = record.resolution is None
                 self._stream_schedule(scan)
                 self._stream_publish(scan)
@@ -715,11 +735,12 @@ class PrepController:
         final = sum(player["team"] == "Bravo" for player in players) == 5
         signature = (final, tuple((row["team"], row["index"], tuple(row["variants"]) if row["status"] != "missing" else (), row["status"],
                                   row["resolution"].get("player_id"), row["resolution"].get("reason")) for row in rows))
-        # Do not emit an empty roster merely because the first OCR frame was
-        # seen; publish missing/failed rows after a lookup, revocation or deadline.
-        has_decision = any(record.resolution is not None for record in scan.stream_rows.values())
+        # A spelling corroborated by independent recognizers can be shown
+        # while its account lookup is pending, without publishing a player ID.
+        has_display_data = any(record.resolution is not None or record.row.get("corroborated_name")
+                               for record in scan.stream_rows.values())
         if not force and (signature == scan.published_signature or
-                          not has_decision and scan.published_signature is None):
+                          not has_display_data and scan.published_signature is None):
             return
         scan.published_signature = signature
         scan.revision += 1

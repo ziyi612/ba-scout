@@ -59,11 +59,16 @@ def main():
     output = owned_path(args.output_dir)
     if output.exists() and any(output.iterdir()):
         raise SystemExit('Output directory is not empty. Choose a fresh --output-dir; no old runtime files are packaged.')
-    required = ['app.py', 'ba_scout/ocr_worker.ps1', 'data/prep-layout-default.json',
+    model = 'ba_scout/ch_PP-OCRv4_rec_infer.onnx'
+    required = ['app.py', 'ba_scout/ocr_worker.ps1', 'ba_scout/name_ocr.ps1', 'ba_scout/name_ocr.cs',
+                model, 'data/prep-layout-default.json', 'licenses/PP-OCRv4-APACHE-2.0.txt',
                 'LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md', 'docs/USER_GUIDE.zh-CN.txt']
     missing = [name for name in required if not (ROOT / name).is_file()]
     if missing:
         raise SystemExit('Missing release inputs: ' + ', '.join(missing))
+    model_digest = '48fc40f24f6d2a207a2b1091d3437eb3cc3eb6b676dc3ef9c37384005483683b'
+    if hashlib.sha256((ROOT / model).read_bytes()).hexdigest() != model_digest:
+        raise SystemExit('The PP-OCRv4 model differs from the licensed upstream release.')
     text = (ROOT / 'ba_scout' / '__init__.py').read_text('utf-8')
     match = re.search(r'^__version__\s*=\s*[\'"]([0-9]+\.[0-9]+\.[0-9]+)[\'"]', text, re.M)
     if not match:
@@ -81,6 +86,8 @@ def main():
     portable = output / 'BA-Scout'
     if not (portable / 'BA-Scout.exe').is_file():
         raise SystemExit('The expected executable was not produced.')
+    if hashlib.sha256((portable / '_internal' / model).read_bytes()).hexdigest() != model_digest:
+        raise SystemExit('The packaged PP-OCRv4 model failed verification.')
     for name in ['LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md', 'data/prep-layout-default.json',
                  'docs/overlay-preview.png', 'docs/overlay-expanded.png']:
         copy_file(ROOT / name, portable / name)

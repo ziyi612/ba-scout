@@ -5,6 +5,7 @@ import hashlib
 import json
 import copy
 import os
+import subprocess
 from pathlib import Path
 import tempfile
 import threading
@@ -62,6 +63,74 @@ class ScreenOCRTests(unittest.TestCase):
         self.assertFalse(client.requests[0]["capture_only"])
         client.release.set()
         self.assertTrue(future.result(1)["ok"])
+
+    def test_native_capture_accepts_game_and_own_overlay_focus_only(self):
+        # The worker defines the same Win32 eligibility check on both sides of
+        # PrintWindow. Hidden native windows exercise ownership without taking focus.
+        env = dict(os.environ, TEMP=self.directory.name, TMP=self.directory.name,
+                   BA_CAPTURE_WORKER=str(SCRATCH.parents[1] / "ba_scout" / "ocr_worker.ps1"),
+                   BA_CAPTURE_CLIENT=str(os.getpid()))
+        command = r"""
+$ErrorActionPreference = 'Stop'
+& $env:BA_CAPTURE_WORKER -TempRoot $env:TEMP -ClientPid ([int]$env:BA_CAPTURE_CLIENT)
+Add-Type -AssemblyName System.Windows.Forms
+$game = New-Object System.Windows.Forms.Form
+$overlay = New-Object System.Windows.Forms.Form
+try {
+    $flags = [Reflection.BindingFlags]'Static,NonPublic'
+    $test = [BAScoutOCR.NativeCapture].GetMethod('EligibleForeground',$flags)
+    $otherClient = [int]$env:BA_CAPTURE_CLIENT
+    $gameChild = New-Object System.Windows.Forms.Button
+    $game.Controls.Add($gameChild)
+    $hwnd = $game.Handle
+    $cover = $overlay.Handle
+    [ordered]@{
+        game = $test.Invoke($null,@($hwnd,$hwnd,$otherClient))
+        child = $test.Invoke($null,@($gameChild.Handle,$hwnd,$otherClient))
+        overlay = $test.Invoke($null,@($cover,$hwnd,[int]$PID))
+        other = $test.Invoke($null,@($cover,$hwnd,$otherClient))
+        noFocus = $test.Invoke($null,@([IntPtr]::Zero,$hwnd,[int]$PID))
+    } | ConvertTo-Json -Compress
+} finally {
+    $overlay.Dispose()
+    $game.Dispose()
+}
+"""
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+            input="", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            encoding="utf-8", errors="replace", timeout=25, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(json.loads(result.stdout.strip().splitlines()[-1]),
+                         {"game": True, "child": True, "overlay": True, "other": False, "noFocus": False})
+
+    def test_packaged_recognizer_and_primary_fallback_on_identical_pixels(self):
+        import shutil
+        from tests.prep_acceptance import make_frames, NAMES
+        scratch = Path(self.directory.name)
+        regions = {team: {"rows": [[x, .22 + i*.14, .14, .025] for i in range(5)]}
+                   for team, x in (("Alpha", .10), ("Bravo", .60))}
+        make_frames(scratch, regions)
+        image = scratch / "5.png"
+        with ScreenOCR(scratch) as client:
+            result = client.submit_extract(image, regions=regions, timeout=18).result(20)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result.get("auxiliary_status"), "ready")
+            readings = [r for r in result["auxiliary_names"] if r["team"] == "Bravo"]
+            self.assertEqual([r["index"] for r in readings], list(range(5)))
+            self.assertEqual([r["text"] for r in readings], list(NAMES))
+            self.assertTrue(all(r["confidence"] > .9 and not r["clipped"] for r in readings))
+            worker = client.worker_script
+        # An unavailable secondary model must not take down Windows OCR.
+        for name in ("ocr_worker.ps1", "name_ocr.ps1", "name_ocr.cs"):
+            shutil.copyfile(worker.with_name(name), scratch / name)
+        with ScreenOCR(scratch) as client:
+            client.worker_script = scratch / worker.name
+            result = client.submit_extract(image, regions=regions, timeout=18).result(20)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["auxiliary_status"], "unavailable")
+            self.assertEqual(result["auxiliary_names"], [])
+            self.assertTrue(result["words"])
 
     def test_calibration_flags_survive_submission(self):
         client = self.client()
@@ -290,9 +359,9 @@ class ScreenOCRTests(unittest.TestCase):
             self.assertEqual(result["ocr_method"], "calibrated_name_regions")
             self.assertEqual(result["coordinate_system"], "original_image_pixels")
             self.assertEqual(result["region_scale"], 3)
-            self.assertEqual(len(result["region_layout"]), 30)
-            self.assertEqual(set(result["preprocessing"]), {"colour_3x", "light_text_140_3x", "light_text_120_3x"})
-            self.assertEqual(len(result["results"]), 3 * len(result["languages"]))
+            self.assertEqual(len(result["region_layout"]), 40)
+            self.assertEqual(set(result["preprocessing"]), {"colour_3x", "light_text_140_3x", "light_text_120_3x", "soft_text_185_3x"})
+            self.assertEqual(len(result["results"]), 4 * len(result["languages"]))
             self.assertLess(result["client_elapsed_seconds"], 8)
             self.assertTrue(result["words"])
             for word in result["words"]:

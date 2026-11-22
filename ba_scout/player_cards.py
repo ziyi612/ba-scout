@@ -60,6 +60,8 @@ class _PlayerCard(tk.Frame):
 
         self.name = label(self.left, owner.name_font)
         self.name.place(x=0, y=0, relwidth=1, height=24)
+        self.encounter = label(self.left, (FONT, -11), ACCENT)
+        self.pending_note = label(self.left, (FONT, -12), MUTED)
         self.metrics = tk.Frame(self.left, bd=0)
         self.metrics.place(x=0, y=25, relwidth=1, height=23)
         self.score_caption = label(self.metrics, (FONT, -11), MUTED, text="评分")
@@ -83,7 +85,7 @@ class _PlayerCard(tk.Frame):
         self.chevron = label(self.right, ("Segoe UI", -13, "bold"), MUTED, text="›")
         self.chevron.place(relx=1, y=0, anchor="ne", height=16, width=9)
 
-        self.fill_widgets = (self.left, self.middle, self.right, self.name, self.metrics,
+        self.fill_widgets = (self.left, self.middle, self.right, self.name, self.encounter, self.pending_note, self.metrics,
                              self.score_caption, self.score, self.win, self.spec_caption,
                              self.specs, self.period, self.opening, self.chevron)
         for target in (self, self.outline, self.status, *self.fill_widgets):
@@ -142,10 +144,24 @@ class _PlayerCard(tk.Frame):
         if width <= 1:
             width = max(710, self.owner.winfo_width())
         name_width = max(24, int(width * .35) - 25)
+        history = self.encounter.cget("text")
+        if history:
+            badge_width = self.encounter.winfo_reqwidth()
+            name_width = max(12, name_width - badge_width - 6)
+            self.encounter.place(relx=1, x=-1, y=2, anchor="ne", height=20)
+        else:
+            self.encounter.place_forget()
+        self.name.place_configure(relwidth=0, width=name_width)
         self.name.configure(text=_fit(name, self.owner.name_font, name_width))
         pending = self.iid.startswith("slot-")
         self.name.configure(fg=MUTED if pending else FG)
-        self.name.place_configure(y=12 if pending else 0)
+        show_note = pending and performance != "—" and bool(performance)
+        self.name.place_configure(y=12 if pending and not show_note else 0)
+        if show_note:
+            self.pending_note.configure(text=performance)
+            self.pending_note.place(x=0, y=25, relwidth=1, height=19)
+        else:
+            self.pending_note.place_forget()
         self.score.configure(text="" if pending else rating)
         self.win.configure(text="" if pending else performance.split("\n", 1)[0].replace("胜率 —", "胜率待查"))
         if pending:
@@ -249,6 +265,13 @@ class PlayerCards(tk.Frame):
         if order:
             self.empty.grid_remove()
 
+    def set_encounters(self, labels):
+        for iid, card in self.cards.items():
+            label = labels.get(iid, "")
+            if card.encounter.cget("text") != label:
+                card.encounter.configure(text=label)
+                card._text()
+
     def set_selected(self, iid):
         self.selected = iid if iid in self.cards else None
         for key, card in self.cards.items():
@@ -299,5 +322,6 @@ class PlayerCards(tk.Frame):
             c = self.cards[iid]
             result.append(dict(iid=iid, name=c.name.cget("text"), rating=c.score.cget("text"),
                                performance=c.win.cget("text"), spec=c.specs.cget("text"),
-                               recent=c.opening.cget("text"), status=c.status.cget("text")))
+                               recent=c.opening.cget("text"), status=c.status.cget("text"),
+                               encounter=c.encounter.cget("text")))
         return result

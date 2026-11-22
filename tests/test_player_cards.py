@@ -48,6 +48,19 @@ class PlayerCardsTests(unittest.TestCase):
                                   rooty=widget.winfo_rooty()+3, time=timestamp)
             self.root.update()
 
+    def test_encounter_mark_shares_the_name_line_and_is_cleared_on_change(self):
+        self.board.set_rows([player(12, "A very long name repeated twice for the layout check")])
+        self.board.set_encounters({"12": "曾为对手 · 曾为队友"})
+        self.root.update()
+        card = self.board.cards["12"]
+        self.assertTrue(card.encounter.winfo_ismapped())
+        self.assertLessEqual(card.name.winfo_x() + card.name.winfo_width(), card.encounter.winfo_x())
+        self.assertEqual(self.board.visible_rows()[0]["encounter"], "曾为对手 · 曾为队友")
+        self.board.set_encounters({})
+        self.root.update()
+        self.assertFalse(card.encounter.winfo_ismapped())
+        self.assertEqual(self.board.visible_rows()[0]["encounter"], "")
+
     def test_cards_arrive_without_replacing_or_reordering_an_existing_player(self):
         self.board.set_rows([player(12), slot(1, "补查中"), player(33)])
         self.root.update()
