@@ -24,6 +24,7 @@ from .settings import app_path
 
 _CACHE_SECONDS = 86400.0
 _MAX_CACHE_BYTES = 2_097_152
+_CACHE_SCHEMA = 3  # Older summaries counted transferred units for the final holder.
 
 
 def _utc_now() -> str:
@@ -337,7 +338,7 @@ class RecentRecon:
             if path.stat().st_size > _MAX_CACHE_BYTES:
                 return None
             wrapper = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(wrapper, dict) or wrapper.get("schema") != 1 or _positive_id(wrapper.get("match_id")) != match_id:
+            if not isinstance(wrapper, dict) or wrapper.get("schema") != _CACHE_SCHEMA or _positive_id(wrapper.get("match_id")) != match_id:
                 return None
             stored_at = _timestamp(wrapper.get("stored_at"))
             age = time.time() - stored_at
@@ -351,7 +352,7 @@ class RecentRecon:
         target = self.cache_dir / f"{match_id}.json"
         temporary = self.cache_dir / f".{match_id}.{uuid.uuid4().hex}.tmp"
         try:
-            wrapper = {"schema": 1, "match_id": match_id, "stored_at": _utc_now(), "data": data}
+            wrapper = {"schema": _CACHE_SCHEMA, "match_id": match_id, "stored_at": _utc_now(), "data": data}
             serialized = json.dumps(wrapper, ensure_ascii=False, allow_nan=False)
             if len(serialized.encode("utf-8")) > _MAX_CACHE_BYTES:
                 return

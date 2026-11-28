@@ -1,7 +1,7 @@
 """Read observed unit instances from one public BATrace match page.
 
 Counts describe one recorded match, not concurrent strength or long-term habits.
-Returned units remain counted; TransferredUnits are deliberately not added.
+Returned units remain counted. Corroborated transfers count for the original deployer.
 No spending, threat, loadout-role or drone classification is inferred.
 """
 
@@ -52,8 +52,48 @@ def _timestamp(value: Any) -> int | float | None:
         return None
 
 
+def _deployments_by_player(players: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Resolve transfers only when both records agree on the same instance."""
+    deployments: dict[str, dict[str, Any]] = {}
+    holders: dict[str, list[str]] = {}
+    transfers: dict[str, list[tuple[str, Any]]] = {}
+    malformed_units = set()
+    for player_key, player in players.items():
+        if not isinstance(player, dict):
+            continue
+        units = player.get("UnitData")
+        if isinstance(units, dict) and units:
+            deployments[player_key] = dict(units)
+            for instance_key in units:
+                holders.setdefault(instance_key, []).append(player_key)
+        elif units is not None and not isinstance(units, dict):
+            malformed_units.add(player_key)
+        outgoing = player.get("TransferredUnits")
+        if isinstance(outgoing, dict):
+            for instance_key, transfer in outgoing.items():
+                transfers.setdefault(instance_key, []).append((player_key, transfer))
+
+    for instance_key, claims in transfers.items():
+        owners = holders.get(instance_key, [])
+        if len(claims) != 1 or len(owners) != 1:
+            continue
+        sender, transfer = claims[0]
+        holder = owners[0]
+        instance = deployments[holder][instance_key]
+        if sender == holder or sender in malformed_units or not isinstance(transfer, dict) or not isinstance(instance, dict):
+            continue
+        unit = _positive_int(transfer.get("Id"))
+        spawned = _timestamp(transfer.get("SpawnTime"))
+        if unit is None or spawned is None:
+            continue
+        if unit == _positive_int(instance.get("Id")) and spawned == _timestamp(instance.get("SpawnTime")):
+            deployments.setdefault(sender, {})[instance_key] = deployments[holder].pop(instance_key)
+
+    return deployments
+
+
 def _deployment_timing(
-    instances: Any,
+    instances: dict[str, Any] | None,
     details: dict[int, dict[str, Any]],
     start_time: int | float | None,
     end_time: int | float | None,
@@ -75,7 +115,7 @@ def _deployment_timing(
         "missing_unit_ids": 0,
         "spawns": [],
     }
-    if not isinstance(instances, dict) or not instances:
+    if instances is None:
         result["reason"] = "未取得非空单位部署记录"
         return result
 
@@ -110,7 +150,8 @@ def _deployment_timing(
         item["id"] is None,
         item["id"] if item["id"] is not None else 0,
     ))
-    result["available"] = valid_instances > 0
+    # An empty mapping here means all observed units were deployed by others.
+    result["available"] = valid_instances > 0 or (bounds_valid and not instances)
     result["complete"] = bounds_valid and valid_instances == len(instances)
     reasons = []
     if not bounds_valid:
@@ -128,7 +169,7 @@ def _deployment_timing(
 
 def _summarize_player(
     player_id: int,
-    player: dict[str, Any],
+    instances: dict[str, Any] | None,
     registry: dict[str, Any],
     unit_names: dict[str, str],
     start_time: int | float | None = None,
@@ -146,8 +187,7 @@ def _summarize_player(
         "all_units": [],
         "air_units": [],
     }
-    instances = player.get("UnitData")
-    if not isinstance(instances, dict) or not instances:
+    if instances is None:
         empty["deployment_timing"] = _deployment_timing(instances, {}, start_time, end_time)
         return empty
 
@@ -156,8 +196,7 @@ def _summarize_player(
     missing_classification = False
     unit_counts: Counter[int] = Counter()
     details: dict[int, dict[str, Any]] = {}
-    # Dictionary keys are the already-unique NetIDs. Every entry is counted
-    # once, including entries bearing WasRefunded; never add TransferredUnits.
+    # Every assigned instance counts once, including refunded units.
     for instance in instances.values():
         unit_id = _positive_int(instance.get("Id")) if isinstance(instance, dict) else None
         item = registry.get(str(unit_id)) if unit_id is not None else None
@@ -208,8 +247,8 @@ def _summarize_player(
 def parse_match_html(html: str, expected_id: str) -> dict[str, Any]:
     """Decode one identified match and summarize its recorded unit instances.
 
-    Missing/empty UnitData gives available=False and null counts. A missing
-    registry/type gives null category totals plus the explicitly known subset.
+    Missing/empty UnitData without corroborated transfers gives unavailable
+    counts. A missing registry/type gives null totals plus the known subset.
     An explicit unsupported type is counted under unknown_types. top_units is
     capped at five; all_units keeps every observed unit, while air_units keeps
     every observed known aviation unit type.
@@ -245,17 +284,15 @@ def parse_match_html(html: str, expected_id: str) -> dict[str, Any]:
     registry = registry if isinstance(registry, dict) else {}
     start_time = _timestamp(info.get("StartTime"))
     end_time = _timestamp(info.get("EndTime"))
+    deployments = _deployments_by_player(info["Data"])
     players = {}
     for player_key, player in info["Data"].items():
         if not isinstance(player_key, str) or re.fullmatch(r"[1-9][0-9]*", player_key) is None:
             raise MatchDataError("BATrace match contains an invalid player key")
         player_id = int(player_key)
-        if not isinstance(player, dict):
-            players[player_key] = _summarize_player(player_id, {}, registry, unit_names, start_time, end_time)
-            continue
-        if "Id" in player and _positive_int(player["Id"]) != player_id:
+        if isinstance(player, dict) and "Id" in player and _positive_int(player["Id"]) != player_id:
             raise MatchDataError("BATrace match player identity disagrees with its key")
-        players[player_key] = _summarize_player(player_id, player, registry, unit_names, start_time, end_time)
+        players[player_key] = _summarize_player(player_id, deployments.get(player_key), registry, unit_names, start_time, end_time)
     return {
         "recon_version": 2,
         "match_id": expected_id,

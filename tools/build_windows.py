@@ -61,6 +61,7 @@ def main():
         raise SystemExit('Output directory is not empty. Choose a fresh --output-dir; no old runtime files are packaged.')
     model = 'ba_scout/ch_PP-OCRv4_rec_infer.onnx'
     required = ['app.py', 'ba_scout/ocr_worker.ps1', 'ba_scout/name_ocr.ps1', 'ba_scout/name_ocr.cs',
+                'ba_scout/install_update.ps1',
                 model, 'data/prep-layout-default.json', 'licenses/PP-OCRv4-APACHE-2.0.txt',
                 'LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md', 'docs/USER_GUIDE.zh-CN.txt']
     missing = [name for name in required if not (ROOT / name).is_file()]

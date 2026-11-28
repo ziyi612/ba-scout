@@ -11,7 +11,8 @@ a = Analysis(
     pathex=[str(ROOT)],
     binaries=[],
     datas=[(str(ROOT / 'ba_scout' / resource), 'ba_scout') for resource in
-           ('ocr_worker.ps1', 'name_ocr.ps1', 'name_ocr.cs', 'ch_PP-OCRv4_rec_infer.onnx')],
+           ('ocr_worker.ps1', 'name_ocr.ps1', 'name_ocr.cs', 'ch_PP-OCRv4_rec_infer.onnx',
+            'install_update.ps1')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

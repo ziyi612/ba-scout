@@ -19,6 +19,8 @@ from .engine import ScanController
 from .encounter_tracker import EncounterTracker, encounter_label
 from .player_cards import PlayerCards
 from .labels import short_combo, combo_country
+from .match_timer import MatchTimerWindow
+from .update_panel import UpdatePanel
 from .metrics import profile_metrics, tied_top_count
 from .provider import fetch_player, profile_history
 from .scouting_engine import BattleRecon
@@ -190,6 +192,7 @@ class ScoutWindow:
         self.report_due_at = None
         self.prep_initial_report_written = False
         self.prep_dialog = None
+        self.match_timer = None
         self.is_replay = False
         self.selected_id = None
         self.last_log_error = None
@@ -211,6 +214,9 @@ class ScoutWindow:
         if not args.self_test and config["self_id"]:
             self.encounters = EncounterTracker(ROOT / "data/encounters.sqlite3", config["self_id"], config["log_dir"])
         self._build()
+        self.updates = UpdatePanel(self.root, ROOT, self.config,
+                                   lambda: not self.is_replay and self.live_phase in {"waiting", "loading", "game_room"},
+                                   self.close, self.show_update_available)
         self._position()
         self.root.update_idletasks()
         self.hwnd = root_handle(self.root)
@@ -227,6 +233,8 @@ class ScoutWindow:
             self.root.after(500, self.self_test_begin)
         else:
             self.root.after_idle(self.warmup_ocr)
+            if not args.replay_log:
+                self.root.after(2500, lambda: self.updates.check(automatic=True))
         logging.info("Application started version=%s; log_dir=%s", __version__, config["log_dir"])
 
     def _build(self):
@@ -374,7 +382,7 @@ class ScoutWindow:
         menu = tk.Menu(self.more_button, tearoff=False)
         for label, command in (("数据表", self.show_table), ("刷新本场", self.refresh), ("测试上局", self.replay_latest),
                                ("复制所选来源", self.copy_source), ("复制数据汇总", self.copy_summary),
-                               ("设置", self.settings_dialog)):
+                               ("对局计时", self.show_match_timer), ("软件更新", self.show_updates), ("设置", self.settings_dialog)):
             menu.add_command(label=label, command=command)
         self.more_button.configure(menu=menu)
         self.more_button.pack(side="right")
@@ -421,6 +429,19 @@ class ScoutWindow:
         for team, button in (("enemy", self.enemy_button), ("ally", self.ally_button)):
             selected = mode != "summary" and team == self.team_mode
             button.config(bg=SELECTED if selected else SURFACE, fg=ACCENT if selected else MUTED)
+
+    def show_match_timer(self):
+        if self.match_timer is None or not self.match_timer.winfo_exists():
+            self.match_timer = MatchTimerWindow(self.root)
+        else:
+            self.match_timer.deiconify()
+            self.match_timer.lift()
+
+    def show_updates(self):
+        self.updates.open()
+
+    def show_update_available(self, available):
+        self.more_button.configure(text="更多 •" if available else "更多 ▾")
 
     def show_table(self):
         self.show_view("data")

@@ -57,7 +57,9 @@ def _timeline(envelope: dict[str, Any], player_id: int) -> tuple[list[dict[str, 
         if type(timing.get(key)) is not int or timing[key] != 0:
             return None, "部署记录含缺失或越界数据"
     spawns = timing.get("spawns")
-    if not isinstance(spawns, list) or not spawns:
+    total_spawns = player.get("total_spawns")
+    known_empty = type(total_spawns) is int and total_spawns == 0
+    if not isinstance(spawns, list) or (not spawns and not known_empty):
         return None, "未取得非空单位部署记录"
     for item in spawns:
         if not isinstance(item, dict) or type(item.get("id")) is not int or item["id"] <= 0:

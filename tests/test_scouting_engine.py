@@ -79,7 +79,7 @@ class BattleReconTests(unittest.TestCase):
         self.controllers.append(controller)
         return controller
 
-    def write_cache(self, match_id, age=0, version=2, schema=2, players=(1, 2, 3)):
+    def write_cache(self, match_id, age=0, version=2, schema=3, players=(1, 2, 3)):
         data = match_data(match_id, players)
         data["recon_version"] = version
         wrapper = {"schema": schema, "match_id": match_id, "stored_at": (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat(), "data": data}
@@ -285,11 +285,11 @@ class BattleReconTests(unittest.TestCase):
         self.assertEqual([e for e in events if e["type"] == "recon"][0]["status"], "error")
         self.assertFalse(list(self.path.glob("*.json")))
 
-    def test_version_two_day_cache_reuses_and_old_expired_or_broken_cache_refreshes(self):
+    def test_current_day_cache_reuses_and_old_expired_or_broken_cache_refreshes(self):
         self.write_cache(100, age=86300)
         self.write_cache(101, age=86500)
         self.write_cache(102, version=1)
-        self.write_cache(103, schema=1)
+        self.write_cache(103, schema=2)
         (self.path / "104.json").write_text("broken", encoding="utf-8")
         calls = []
         controller = self.controller(lambda match_id, timeout: (calls.append(match_id), match_data(match_id))[1])

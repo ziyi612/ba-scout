@@ -36,6 +36,7 @@ DEFAULTS = {
     "x": None,
     "y": 80,
     "prep_enabled": True,
+    "update_check_on_start": True,
     "prep_regions": default_prep_regions(),
 }
 

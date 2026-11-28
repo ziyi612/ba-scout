@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
+from ba_scout.opening import aggregate_openings
 from ba_scout.recon_provider import (
     MAX_HTML_BYTES,
     MatchDataError,
@@ -43,6 +44,22 @@ def fixture():
 def html_for(props):
     stream = "1:" + json.dumps(props, ensure_ascii=False) + "\n"
     return "<html><script>self.__next_f.push(" + json.dumps([1, stream], ensure_ascii=False) + ")</script></html>"
+
+
+def transfer_fixture():
+    data = fixture()
+    info = data["initialMatchData"]["matchInfo"]
+    start = info["EndTime"] - 180
+    info["StartTime"] = start
+    transferred = {"Id": 1, "SpawnTime": start + 7}
+    info["Data"] = {
+        "7": {"Id": 7, "TransferredUnits": {"a": transferred}},
+        "8": {"Id": 8, "UnitData": {
+            "a": {**transferred, "WasRefunded": True},
+            "b": {"Id": 2, "SpawnTime": start + 40},
+        }},
+    }
+    return data
 
 
 class FakeResponse:
@@ -81,6 +98,53 @@ class MatchParserTests(unittest.TestCase):
         self.assertEqual(len(player["all_units"]), 4)
         self.assertEqual(result["match_end_time"], 1792846260)
         self.assertIsNone(result["fetched_at"])
+
+    def test_corroborated_transfer_counts_once_for_original_deployer(self):
+        result = parse_match_html(html_for(transfer_fixture()), "42")
+        original = result["players"]["7"]
+        holder = result["players"]["8"]
+        self.assertEqual((original["total_spawns"], holder["total_spawns"]), (1, 1))
+        self.assertEqual((original["fixed_wing"], holder["fixed_wing"]), (1, 0))
+        self.assertEqual(original["deployment_timing"]["spawns"][0]["offset_s"], 7)
+        self.assertEqual(holder["deployment_timing"]["spawns"][0]["offset_s"], 40)
+        first_twenty = aggregate_openings(7, [result], window_seconds=20)
+        self.assertEqual([unit["id"] for unit in first_twenty["units"]], [1])
+        self.assertEqual(aggregate_openings(8, [result], window_seconds=20)["units"], [])
+        first_two_minutes = aggregate_openings(8, [result], window_seconds=120)
+        self.assertEqual([unit["id"] for unit in first_two_minutes["units"]], [2])
+
+    def test_only_received_units_give_a_known_empty_opening_sample(self):
+        data = transfer_fixture()
+        del data["initialMatchData"]["matchInfo"]["Data"]["8"]["UnitData"]["b"]
+        result = parse_match_html(html_for(data), "42")
+        holder = result["players"]["8"]
+        self.assertEqual(holder["total_spawns"], 0)
+        self.assertTrue(holder["deployment_timing"]["complete"])
+        opening = aggregate_openings(8, [result], window_seconds=20)
+        self.assertEqual(opening["sample_count"], 1)
+        self.assertEqual(opening["units"], [])
+
+    def test_invalid_or_ambiguous_transfer_leaves_the_unit_record_in_place(self):
+        for case in ("missing_time", "different_time", "different_unit", "two_claims", "two_holders", "bad_units"):
+            with self.subTest(case=case):
+                data = transfer_fixture()
+                players = data["initialMatchData"]["matchInfo"]["Data"]
+                claim = players["7"]["TransferredUnits"]["a"]
+                if case == "missing_time":
+                    del claim["SpawnTime"]
+                elif case == "different_time":
+                    claim["SpawnTime"] += 1
+                elif case == "different_unit":
+                    claim["Id"] = 2
+                elif case == "two_claims":
+                    players["9"] = {"TransferredUnits": {"a": claim}}
+                elif case == "two_holders":
+                    players["9"] = {"UnitData": {"a": claim}}
+                else:
+                    players["7"]["UnitData"] = []
+                result = parse_match_html(html_for(data), "42")
+                self.assertIsNone(result["players"]["7"]["total_spawns"])
+                self.assertEqual(result["players"]["8"]["total_spawns"], 2)
 
     def test_match_and_player_identity_must_agree(self):
         with self.assertRaisesRegex(MatchDataError, "different match"):

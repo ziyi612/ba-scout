@@ -55,9 +55,9 @@ class ReconEngineTests(unittest.TestCase):
         self.controllers.append(controller)
         return controller
 
-    def write_cache(self, match_id, age=0, players=(1, 2, 3)):
+    def write_cache(self, match_id, age=0, players=(1, 2, 3), schema=3):
         stored_at = (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat()
-        wrapper = {"schema": 1, "match_id": match_id, "stored_at": stored_at, "data": match_data(match_id, players)}
+        wrapper = {"schema": schema, "match_id": match_id, "stored_at": stored_at, "data": match_data(match_id, players)}
         (self.path / f"{match_id}.json").write_text(json.dumps(wrapper), encoding="utf-8")
 
     def test_shared_match_is_fetched_once_and_later_submit_reuses_result(self):
@@ -109,6 +109,7 @@ class ReconEngineTests(unittest.TestCase):
     def test_one_day_cache_avoids_fetch_and_expired_cache_refreshes(self):
         self.write_cache(100, age=86300)
         self.write_cache(101, age=86500)
+        self.write_cache(102, schema=1)
         calls = []
 
         def fetch(match_id, timeout):
@@ -116,13 +117,15 @@ class ReconEngineTests(unittest.TestCase):
             return match_data(match_id)
 
         controller = self.controller(fetch)
-        controller.start([1, 2])
+        controller.start([1, 2, 3])
         controller.submit(1, 100)
         controller.submit(2, 101)
-        events = {e["player_id"]: e for e in wait_events(controller, 2)}
-        self.assertEqual(calls, [101])
+        controller.submit(3, 102)
+        events = {e["player_id"]: e for e in wait_events(controller, 3)}
+        self.assertCountEqual(calls, [101, 102])
         self.assertTrue(events[1]["from_cache"])
         self.assertFalse(events[2]["from_cache"])
+        self.assertFalse(events[3]["from_cache"])
 
     def test_deadline_is_from_start_and_late_response_never_writes(self):
         release = threading.Event()
