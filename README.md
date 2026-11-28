@@ -93,8 +93,4 @@ python -m venv .venv
 
 ## 开发与许可
 
-0.12.0 的更新流程、对局计时和转交归属统计参考了 [BAX](https://github.com/JohnJinHM/BAX/tree/a50d677daa039f2cfe32290691d218f88639a504) 的设计与数据验证。开局统计按战报实例键、型号和部署时间核对转交，证据一致时归给原出兵者。
-
 项目源码和原创说明使用 [MIT License](LICENSE)。Python、Tcl/Tk、PyInstaller 等组件保留各自许可，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与 `licenses/`。
-
-修改请保持：不猜测身份、不把缺失值当零、不将旧缓存标成新数据、不把受控录制测试称为真实联网或实局验收。
